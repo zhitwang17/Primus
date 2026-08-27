@@ -22,6 +22,10 @@ turbo_grouped_gemm_backend: default
 # default and requires a Primus-Turbo grouped GEMM implementation with matching
 # activation and gradient layouts.
 mxfp4_gradient_stochastic_rounding: false
+# E8M0 scale exponent rounding mode passed to Primus-Turbo: 0 (legacy/default),
+# 1, or 2. The trainer validates this integer and exports the resolved value as
+# PRIMUS_TURBO_MXFP4_SCALE_ROUNDING before model construction.
+mxfp4_scale_rounding_mode: 0
 
 # ===== Attention =====
 # operator switch

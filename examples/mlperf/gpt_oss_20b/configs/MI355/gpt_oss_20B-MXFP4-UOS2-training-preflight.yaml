@@ -1,0 +1,63 @@
+# GPT-OSS-20B Megatron MXFP4/UOS candidate used by the 2026-08-27 preflight.
+# This is a Megatron-native overlay; it does not import a TorchTitan/ALTO modifier.
+extends:
+  - gpt_oss_20B-MXFP4-deosc-mlperf-pretrain.yaml
+
+exp_name: ${EXP_NAME:gpt_oss_20b_mxfp4_uos2_preflight}
+
+# This is consumed by TrainRuntime before backend/model initialization. Turbo's
+# GEMM path selects RHT on its required colwise operands directly; the env also
+# keeps the TE MXFP4 recipe metadata aligned for any TE-owned path.
+env:
+  NVTE_MXFP4_USE_HADAMARD: "1"
+
+modules:
+  pre_trainer:
+    overrides:
+      # Quantize every transformer layer. The GPT output layer (lm_head) and
+      # standalone MoE router gate remain outside the per-layer FP4 context.
+      fp8: null
+      fp4: e2m1
+      fp4_recipe: mxfp4
+      first_last_layers_bf16: false
+      num_layers_at_start_in_bf16: 0
+      num_layers_at_end_in_bf16: 0
+      mxfp4_gradient_stochastic_rounding: true
+      mxfp4_scale_rounding_mode: 2
+
+      # Target schedule: 128 warmup steps, then cosine decay for the remainder
+      # of the 1,200,000-step cap.
+      train_iters: 1200000
+      lr: 8.0e-4
+      min_lr: 4.0e-5
+      lr_warmup_iters: 128
+      lr_decay_iters: 1199872
+      lr_decay_style: cosine
+      init_method_std: 0.008
+
+      # Single-node 8xMI355X recipe.
+      micro_batch_size: 4
+      global_batch_size: 32
+      seq_length: 8192
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+
+      # No expert balancing or auxiliary balancing loss.
+      moe_router_force_load_balancing: false
+      moe_router_load_balancing_type: none
+      moe_aux_loss_coeff: 0.0
+      moe_router_enable_expert_bias: false
+
+      # Weight de-oscillation is validated independently because a 1-3 step
+      # smoke test cannot reach start_step=1000.
+      weight_deosc: true
+      weight_deosc_start_step: 1000
+      weight_deosc_period: 100
+      weight_deosc_ratio: 3.0
+
+      # Explicitly retain the Turbo MXFP4 implementations selected by the base
+      # GPT-OSS recipe.
+      enable_primus_turbo: true
+      use_turbo_gemm: true
+      use_turbo_grouped_gemm: true

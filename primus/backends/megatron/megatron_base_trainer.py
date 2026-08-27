@@ -23,9 +23,29 @@ class MegatronBaseTrainer(BaseTrainer):
 
     def setup(self):
         """Setup Megatron runtime: set global vars and patch parse_args."""
+        self._configure_mxfp4_scale_rounding()
         self._ensure_megatron_path()
         set_primus_global_variables(self.backend_args)
         self._patch_parse_args()
+
+    def _configure_mxfp4_scale_rounding(self) -> int:
+        """Validate and export the resolved Turbo MXFP4 scale-rounding mode.
+
+        This runs before Megatron model construction or any Primus-Turbo quantizer
+        invocation.  Always writing the environment variable makes the resolved
+        Primus configuration authoritative over a stale parent-shell value.
+        """
+        mode = getattr(self.backend_args, "mxfp4_scale_rounding_mode", 0)
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in (0, 1, 2):
+            raise ValueError(f"mxfp4_scale_rounding_mode must be an integer in {{0, 1, 2}}, got {mode!r}")
+
+        os.environ["PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"] = str(mode)
+        log_rank_0(
+            "[Primus:MegatronBaseTrainer] Resolved MXFP4 scale rounding: "
+            f"mxfp4_scale_rounding_mode={mode}, "
+            f"PRIMUS_TURBO_MXFP4_SCALE_ROUNDING={mode}"
+        )
+        return mode
 
     def _ensure_megatron_path(self):
         """Ensure Megatron-LM path is in sys.path before any megatron imports."""
@@ -35,7 +55,7 @@ class MegatronBaseTrainer(BaseTrainer):
 
         # First, check if megatron is already importable
         try:
-            import megatron  # type: ignore
+            import megatron as _megatron  # type: ignore  # noqa: F401
 
             return  # Path already set correctly
         except ImportError:
@@ -92,7 +112,7 @@ class MegatronBaseTrainer(BaseTrainer):
 
         # Verify the path was set correctly by trying to import
         try:
-            import megatron  # type: ignore
+            import megatron as _megatron  # type: ignore  # noqa: F401
 
             log_rank_0("[Primus:MegatronBaseTrainer] Successfully verified megatron import")
         except ImportError as e:
@@ -194,9 +214,9 @@ class MegatronBaseTrainer(BaseTrainer):
 
         log_rank_0("Patching Megatron-LM parse_args()")
 
-        patched_parse_args = lambda *args, **kwargs: (
-            log_rank_0("parse_args() called; returning Primus arguments") or self.backend_args
-        )
+        def patched_parse_args(*args, **kwargs):
+            log_rank_0("parse_args() called; returning Primus arguments")
+            return self.backend_args
 
         megatron_args.parse_args = patched_parse_args
         megatron_init.parse_args = patched_parse_args

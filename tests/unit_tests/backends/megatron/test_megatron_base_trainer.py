@@ -58,6 +58,35 @@ def _build_trainer(monkeypatch: pytest.MonkeyPatch, backend_args=None):
 class TestMegatronBaseTrainer:
     """Tests for MegatronBaseTrainer setup and path resolution."""
 
+    @pytest.mark.parametrize("mode", [0, 1, 2])
+    def test_configure_mxfp4_scale_rounding(self, monkeypatch: pytest.MonkeyPatch, mode: int):
+        trainer = _build_trainer(monkeypatch, SimpleNamespace(mxfp4_scale_rounding_mode=mode))
+        monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", "stale")
+        messages = []
+        monkeypatch.setattr(
+            "primus.backends.megatron.megatron_base_trainer.log_rank_0",
+            messages.append,
+        )
+
+        assert trainer._configure_mxfp4_scale_rounding() == mode
+        assert os.environ["PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"] == str(mode)
+        assert any(f"mxfp4_scale_rounding_mode={mode}" in message for message in messages)
+
+    def test_configure_mxfp4_scale_rounding_defaults_to_zero(self, monkeypatch: pytest.MonkeyPatch):
+        trainer = _build_trainer(monkeypatch, SimpleNamespace())
+        monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", "2")
+
+        assert trainer._configure_mxfp4_scale_rounding() == 0
+        assert os.environ["PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"] == "0"
+
+    @pytest.mark.parametrize("mode", [True, False, -1, 3, "2", None, 1.5])
+    def test_configure_mxfp4_scale_rounding_rejects_invalid_values(
+        self, monkeypatch: pytest.MonkeyPatch, mode
+    ):
+        trainer = _build_trainer(monkeypatch, SimpleNamespace(mxfp4_scale_rounding_mode=mode))
+        with pytest.raises(ValueError, match="must be an integer"):
+            trainer._configure_mxfp4_scale_rounding()
+
     def test_ensure_megatron_path_from_primus_path_env(self, monkeypatch: pytest.MonkeyPatch):
         """Test path resolution from PRIMUS_PATH environment variable."""
         trainer = _build_trainer(monkeypatch)
