@@ -55,6 +55,8 @@ def test_gpt_oss_mxfp4_uos2_recipe_resolves_target_training_contract():
         "enable_primus_turbo": True,
         "use_turbo_gemm": True,
         "use_turbo_grouped_gemm": True,
+        "turbo_gemm_backend": "fp4:hipblaslt",
+        "turbo_grouped_gemm_backend": "fp4:flydsl",
     }
 
     assert {key: overrides[key] for key in expected} == expected

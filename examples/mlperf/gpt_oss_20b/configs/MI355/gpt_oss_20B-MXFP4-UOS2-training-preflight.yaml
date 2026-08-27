@@ -61,3 +61,9 @@ modules:
       enable_primus_turbo: true
       use_turbo_gemm: true
       use_turbo_grouped_gemm: true
+      # The base launch shell pins every precision to Triton, but current
+      # dense FP4 registers AITER/HIPBLASLt/FlyDSL only. Use the UOS-aware
+      # HIPBLASLt dense path (handles hidden size 2880) and FlyDSL grouped
+      # path; leave non-FP4 precisions on their normal dispatcher defaults.
+      turbo_gemm_backend: fp4:hipblaslt
+      turbo_grouped_gemm_backend: fp4:flydsl
