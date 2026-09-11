@@ -21,6 +21,9 @@ from megatron.core.typed_torch import apply_module
 from megatron.training.global_vars import get_args
 
 
+_fused_grouped_mlp_trace_seen = False
+
+
 class PrimusGroupedMLP(TEGroupedMLP):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -47,6 +50,7 @@ class PrimusGroupedMLP(TEGroupedMLP):
         self.use_turbo_fused_act_with_probs = args.use_turbo_fused_act_with_probs
         self.moe_router_padding_for_quantization = args.moe_router_padding_for_quantization
         self.turbo_grouped_gemm_without_padding = getattr(args, "turbo_grouped_gemm_without_padding", False)
+        self.turbo_fused_grouped_gemm = getattr(args, "turbo_fused_grouped_gemm", False)
         # PrimusTurbo grouped GEMMs consume the original GPU tokens_per_expert
         # tensor for every supported quantization recipe. Keep TE's explicit
         # zero-padding fallback only when the no-padding path is not enabled.
@@ -193,6 +197,65 @@ class PrimusGroupedMLP(TEGroupedMLP):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        if self.turbo_fused_grouped_gemm:
+            global _fused_grouped_mlp_trace_seen
+            trace_first_call = not _fused_grouped_mlp_trace_seen
+            if trace_first_call:
+                _fused_grouped_mlp_trace_seen = True
+                rank = torch.distributed.get_rank()
+                if rank == 0:
+                    print(
+                        "[Primus][MXFP4 fused grouped MLP] dispatch "
+                        f"rank={rank} x={tuple(permuted_local_hidden_states.shape)}",
+                        flush=True,
+                    )
+
+            assert (
+                tokens_per_expert.device == permuted_local_hidden_states.device
+            ), "tokens_per_expert and permuted_local_hidden_states must be on the same device"
+
+            if self.activation_func != F.silu or not self.config.gated_linear_unit:
+                raise ValueError("turbo_fused_grouped_gemm only supports SwiGLU")
+
+            from primus_turbo.pytorch.ops.grouped_mlp_fp4 import grouped_mlp_fp4
+
+            from primus.backends.megatron.core.extensions.primus_turbo import (
+                PrimusTurboLowPrecisionGlobalStateManager,
+            )
+
+            quant_config = PrimusTurboLowPrecisionGlobalStateManager.get_turbo_quant_config()
+            assert (
+                quant_config.is_fp4() and quant_config.mxfp4_scaling()
+            ), "turbo_fused_grouped_gemm requires MXFP4"
+
+            output = grouped_mlp_fp4(
+                permuted_local_hidden_states,
+                self.linear_fc1.weights,
+                self.linear_fc2.weights,
+                tokens_per_expert,
+                probs=permuted_probs,
+                trans_w1=True,
+                trans_w2=True,
+                config=quant_config.data(),
+                activation="silu",
+                fuse_wgrad_accum_pattern="megatron",
+            )
+            # The fused kernel quantizes both grouped weights internally, so it
+            # bypasses the per-linear marker used by WeightDeOsc eligibility.
+            # Publish the same lightweight marker as the direct grouped FP4 path.
+            for linear in (self.linear_fc1, self.linear_fc2):
+                if linear.quantized_weight_buffer is None:
+                    linear.quantized_weight_buffer = torch.empty(
+                        0, device=linear.weights.device, dtype=torch.float4_e2m1fn_x2
+                    )
+            if trace_first_call and rank == 0:
+                print(
+                    f"[Primus][MXFP4 fused grouped MLP] returned rank={rank} "
+                    f"output={tuple(output.shape)}",
+                    flush=True,
+                )
+            return output, None
+
         use_explicit_quantization_padding = self._use_explicit_quantization_padding()
         if use_explicit_quantization_padding:
             # NOTE: When moe_router_padding_for_quantization is true the token is padded. So we can skip the padding here to reduce cpu sync.

@@ -40,6 +40,7 @@ modules:
       wandb_project: "Primus_GPT_OSS_20B"
       stderr_sink_level: ERROR
       log_interval: ${LOG_INTERVAL:999999}
+      distributed_timeout_minutes: ${PRIMUS_DISTRIBUTED_TIMEOUT_MINUTES:60}
 
       # profile
       profile: ${PRIMUS_PROFILE:False}
@@ -183,11 +184,12 @@ modules:
       enable_primus_turbo: true
       use_turbo_gemm: true
       weight_deosc: true
-      weight_deosc_start_step: 768
-      weight_deosc_period: 100
-      weight_deosc_ratio: 4.0
+      weight_deosc_start_step: ${PRIMUS_WEIGHT_DEOSC_START_STEP:768}
+      weight_deosc_period: ${PRIMUS_WEIGHT_DEOSC_PERIOD:100}
+      weight_deosc_ratio: ${PRIMUS_WEIGHT_DEOSC_RATIO:4.0}
       weight_deosc_log_freq: 1
       use_turbo_grouped_gemm: true
+      turbo_fused_grouped_gemm: ${PRIMUS_TURBO_FUSED_GROUPED_GEMM:true}
       turbo_grouped_gemm_without_padding: ${TURBO_GROUPED_GEMM_WITHOUT_PADDING:true}
       use_turbo_rms_norm: true
       use_turbo_norm_te_linear: true
