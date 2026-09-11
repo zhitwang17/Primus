@@ -124,7 +124,7 @@ def test_local_shard_qdq_treats_grouped_experts_as_independent_2d_matrices(monke
     q_local = qdq_mxfp4_local_shard(shard, shape, start, end, torch.bfloat16)
 
     assert torch.equal(q_local, shard.to(torch.bfloat16))
-    assert [tuple(tile.shape) for tile in calls] == [(32, 64), (64, 64), (32, 64)]
+    assert [tuple(tile.shape) for tile in calls] == [(1, 64, 64)] * 3
 
 
 # ---------------------------------------------------------------------------

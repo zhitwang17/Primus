@@ -54,6 +54,7 @@ modules:
       fp4: e2m1
       fp4_recipe: mxfp4
       mxfp4_gradient_stochastic_rounding: true
+      mxfp4_scale_rounding_mode: ${PRIMUS_TURBO_MXFP4_SCALE_ROUNDING:2}
       clip_grad: 1.0
       first_last_layers_bf16: false
       num_layers_at_start_in_bf16: 1

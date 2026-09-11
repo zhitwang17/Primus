@@ -441,6 +441,7 @@ class PrimusTurboQuantConfig:
         scale_dtype: ScaleDtype = ScaleDtype.FP32,
         block_size: int = None,
         use_gradient_sr: bool = True,
+        scale_rounding_mode: int = 0,
     ):
         self._is_fp4 = False
         self._is_fp8 = False
@@ -453,6 +454,7 @@ class PrimusTurboQuantConfig:
                 scale_dtype=scale_dtype,
                 block_size=block_size,
                 use_gradient_sr=use_gradient_sr,
+                scale_rounding_mode=scale_rounding_mode,
             )
             self._is_fp4 = True
         else:

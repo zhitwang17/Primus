@@ -85,6 +85,17 @@ except (ImportError, ModuleNotFoundError):
     _ScalingGranularity = None
     _float4_e2m1fn_x2 = None
 
+try:
+    from primus_turbo.pytorch.ops.quantization import (
+        dequantize_fp4 as _dequantize_fp4,
+    )
+    from primus_turbo.pytorch.ops.quantization import (
+        quantize_fp4_with_trans as _quantize_fp4_with_trans,
+    )
+except (ImportError, ModuleNotFoundError):
+    _dequantize_fp4 = None
+    _quantize_fp4_with_trans = None
+
 # Block size used by the Primus-Turbo MXFP4 weight path (== 32).
 try:
     from primus.backends.megatron.core.fp4_utils import MXFP4_SCALING_BLOCK_SIZE
@@ -141,6 +152,8 @@ def deosc_dependencies_available() -> Tuple[bool, str]:
         return False, "primus_turbo ScalingRecipe / MXScalingRecipe is unavailable"
     if _ScalingGranularity is None or _float4_e2m1fn_x2 is None:
         return False, "primus_turbo low_precision MXFP4 symbols are unavailable"
+    if _quantize_fp4_with_trans is None or _dequantize_fp4 is None:
+        return False, "primus_turbo MXFP4 quantize/dequantize ops are unavailable"
     return True, ""
 
 
@@ -153,14 +166,17 @@ def qdq_mxfp4(weight: torch.Tensor) -> torch.Tensor:
     ``ScalingRecipe(use_2d_block=True)``, quantized along ``axis=-1``.
 
     Supports 2D dense weights ``[out, in]`` and 3D grouped expert weights
-    ``[num_experts, out, in]``. The grouped case is handled per-expert because
-    the single-direction MXFP4 kernel only accepts 2D input; this reproduces the
-    Primus-Turbo grouped MXFP4 forward weight operand (PR #398), which quantizes
-    each expert row-wise along the K (in) axis with ``use_2d_block=True``.
-    Whether a grouped weight is actually de-osc eligible still depends on the
-    grouped FP4 forward setting ``quantized_weight_buffer`` on its module.
+    ``[num_experts, out, in]``. Primus-Turbo c1325 supports native batched 3D
+    MXFP4 dual quantization; use that path for grouped weights to match
+    ``grouped_mlp_fp4`` and avoid one HIP quantize launch per expert.
     """
     recipe = _ScalingRecipe(use_2d_block=True)
+    scale_rounding_mode = int(os.environ.get("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", "0"))
+    if scale_rounding_mode not in (0, 1, 2):
+        raise ValueError(
+            "PRIMUS_TURBO_MXFP4_SCALE_ROUNDING must be 0, 1, or 2, "
+            f"got {scale_rounding_mode}"
+        )
 
     def _qdq_2d(w2d: torch.Tensor) -> torch.Tensor:
         qt = _PrimusTurboQuantizedTensor.quantize(
@@ -170,6 +186,7 @@ def qdq_mxfp4(weight: torch.Tensor) -> torch.Tensor:
             block_size=MXFP4_SCALING_BLOCK_SIZE,
             scaling_recipe=recipe,
             axis=-1,
+            scale_rounding_mode=scale_rounding_mode,
         )
         out = qt.dequantize()
         # dequantize() only un-pads the last dim; defensively restore the exact
@@ -181,7 +198,28 @@ def qdq_mxfp4(weight: torch.Tensor) -> torch.Tensor:
     if weight.ndim == 2:
         return _qdq_2d(weight)
     if weight.ndim == 3:
-        return torch.stack([_qdq_2d(weight[g]) for g in range(weight.shape[0])], dim=0)
+        q_row, scale_row, q_col, scale_col = _quantize_fp4_with_trans(
+            weight,
+            _float4_e2m1fn_x2,
+            _ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP4_SCALING_BLOCK_SIZE,
+            scaling_recipe=recipe,
+            scaling_recipe_for_trans=recipe,
+            scale_rounding_mode=scale_rounding_mode,
+        )
+        del q_col, scale_col
+        out = _dequantize_fp4(
+            q_row,
+            weight.dtype,
+            _ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP4_SCALING_BLOCK_SIZE,
+            axis=weight.ndim - 1,
+            scale_inv=scale_row,
+            scaling_recipe=recipe,
+        )
+        if out.shape != weight.shape:
+            out = out[tuple(slice(0, s) for s in weight.shape)].contiguous()
+        return out.to(weight.dtype)
     raise ValueError(f"qdq_mxfp4 expects a 2D or 3D weight, got {weight.ndim}D")
 
 
@@ -229,14 +267,10 @@ def qdq_mxfp4_local_shard(
 
     rows, cols = shape[-2:]
     matrix_numel = rows * cols
-    first_matrix = start // matrix_numel
-    last_matrix = (end - 1) // matrix_numel
     block = MXFP4_SCALING_BLOCK_SIZE
 
-    for matrix_idx in range(first_matrix, last_matrix + 1):
+    def _qdq_partial_matrix(matrix_idx: int, local_begin: int, local_end: int) -> None:
         matrix_base = matrix_idx * matrix_numel
-        local_begin = max(start, matrix_base)
-        local_end = min(end, matrix_base + matrix_numel)
         begin_in_matrix = local_begin - matrix_base
         end_in_matrix = local_end - matrix_base
 
@@ -244,6 +278,14 @@ def qdq_mxfp4_local_shard(
         last_row = (end_in_matrix - 1) // cols
         tile_row_begin = (first_row // block) * block
         tile_row_end = ((last_row // block) + 1) * block
+        if len(shape) == 3:
+            # Keep grouped boundary fragments on the same batched 3D FlyDSL
+            # path. Padding by complete 32-row scale blocks cannot affect the
+            # real rows and satisfies dual3's 64-row alignment requirement.
+            tile_rows = tile_row_end - tile_row_begin
+            tile_row_end = tile_row_begin + (
+                (tile_rows + 2 * block - 1) // (2 * block)
+            ) * (2 * block)
 
         tile = torch.zeros(
             (tile_row_end - tile_row_begin, cols),
@@ -256,8 +298,35 @@ def qdq_mxfp4_local_shard(
         shard_end = local_end - start
         tile.reshape(-1)[tile_begin:tile_end].copy_(local_model[shard_begin:shard_end])
 
-        q_tile = qdq_mxfp4(tile)
+        q_tile = qdq_mxfp4(tile.unsqueeze(0))[0] if len(shape) == 3 else qdq_mxfp4(tile)
         q_local[shard_begin:shard_end].copy_(q_tile.reshape(-1)[tile_begin:tile_end])
+
+    if len(shape) == 2:
+        _qdq_partial_matrix(0, start, end)
+        return q_local
+
+    # A DP shard may start/end inside an expert. Keep those two boundary
+    # fragments on the established 2D tile-preserving path, but quantize all
+    # fully-owned experts between them in one native 3D Turbo call.
+    cursor = start
+    if cursor % matrix_numel:
+        matrix_idx = cursor // matrix_numel
+        prefix_end = min(end, (matrix_idx + 1) * matrix_numel)
+        _qdq_partial_matrix(matrix_idx, cursor, prefix_end)
+        cursor = prefix_end
+
+    full_end = end - (end % matrix_numel)
+    if cursor < full_end:
+        shard_begin = cursor - start
+        shard_end = full_end - start
+        expert_count = (full_end - cursor) // matrix_numel
+        full_experts = local_model[shard_begin:shard_end].view(expert_count, rows, cols)
+        q_full_experts = qdq_mxfp4(full_experts)
+        q_local[shard_begin:shard_end].copy_(q_full_experts.reshape(-1))
+        cursor = full_end
+
+    if cursor < end:
+        _qdq_partial_matrix(cursor // matrix_numel, cursor, end)
 
     return q_local
 
