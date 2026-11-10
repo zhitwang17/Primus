@@ -219,7 +219,7 @@ def validate_args_on_rocm(args):
         ), f"{args.fp8_recipe} recipe is not support when enable `use_turbo_gemm`."
 
     # Check both dense and grouped consumers, not just the dense Turbo flag.
-    # Reference recipes have a P0 contract but no P1 training consumer yet.
+    # Reference recipes select dedicated QDQ consumers, not Turbo MXFP4 kernels.
     validate_fp4_options(args, environ=os.environ)
 
     # Turbo FP4 autocast check: PrimusTurboLinear quantizes only under the Turbo

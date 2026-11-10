@@ -869,16 +869,17 @@ def primus_turbo_fp4_autocast(
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
-    from primus.backends.megatron.core.fp4_dispatch import (
-        current_fp4_plan,
-        module_fp4_context,
-    )
+    from primus.backends.megatron.core.fp4_dispatch import current_fp4_plan
 
     if current_fp4_plan() is not None or qrecipe.fp4_quantization_recipe in ("nvfp4", "amdfp4"):
-        return module_fp4_context(
-            qrecipe,
-            get_args(),
-            quantized=FP8GlobalStateManager.is_fp8_enabled() or _is_fp4_or_fp8_enabled(),
+        if current_fp4_plan() is None:
+            quantized = FP8GlobalStateManager.is_fp8_enabled() or _is_fp4_or_fp8_enabled()
+            flag = "override_quantized_autocast" if quantized else "override_nonquantized_autocast"
+            if not getattr(qrecipe, flag):
+                return nullcontext()
+        raise ValueError(
+            "Two-level FP4 requires the reference spec provider and reference linear modules; "
+            "a Turbo GEMM module cannot consume NVFP4/AMDFP4 metadata"
         )
     # Decide from the same state the Turbo forward will consult. The Turbo GEMM
     # branch is chosen from the Turbo fp8/fp4 flags, and those stay on in places

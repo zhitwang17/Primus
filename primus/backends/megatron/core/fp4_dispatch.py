@@ -1,12 +1,7 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""Explicit two-level FP4 recipe selection and fail-closed execution gates.
-
-P0 provides configuration, metadata and scoped recipe state. P1 supplies the
-Megatron dense/grouped reference consumers. Selecting a recipe is not proof
-that a kernel exists; training must pass require_execution() first.
-"""
+"""Explicit two-level FP4 recipe selection and reference execution guards."""
 
 from __future__ import annotations
 
@@ -69,17 +64,15 @@ class FP4ExecutionPlan:
             "backend": self.backend,
             "module_kind": self.module_kind,
             "execution_status": (
-                "P1 consumer required" if self.backend == "reference" else "TE device check required"
+                "QDQ reference consumer" if self.backend == "reference" else "TE device check required"
             ),
         }
 
     def require_execution(self):
         if self.backend == "reference":
-            raise NotImplementedError(
-                f"{self.config.recipe}/{self.module_kind}: P0 recipe and tensor contracts are available, "
-                "but the P1 Megatron QDQ reference consumer is not implemented. "
-                "Refusing unquantized BF16 or MXFP4 fallback."
-            )
+            from .fp4_autograd import grouped_linear, linear
+
+            assert callable(grouped_linear if self.module_kind == "grouped" else linear)
         # TE owns its actual device/version/kernel check. This does not certify
         # NVFP4 availability on ROCm; no AMDFP4 TE plan can be constructed.
 
@@ -98,7 +91,7 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
         elif recipe.recipe == "nvfp4":
             backend = "te"
         else:
-            raise ValueError("AMDFP4 requires explicit fp4_backend=reference (P0 contract only)")
+            raise ValueError("AMDFP4 requires explicit fp4_backend=reference")
     if backend == "turbo":
         raise ValueError(f"Turbo {module_kind} GEMM supports MXFP4 block32/E8M0, not {recipe.recipe}")
     if backend not in ("reference", "te"):
@@ -118,16 +111,45 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
         for name in ("fp4_param", "fp4_param_gather", "fp4_use_native_te_autocast"):
             if _boolean(option(config, name, False, fallback), name):
                 raise ValueError(f"fp4_backend=reference requires {name}=false/null")
-        for name in ("tensor_model_parallel_size", "expert_model_parallel_size"):
+        for name in (
+            "tensor_model_parallel_size",
+            "expert_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+        ):
             if option(config, name, 1, fallback) != 1:
-                raise ValueError(f"P0 reference contract requires {name}=1")
+                raise ValueError(f"FP4 reference consumer requires {name}=1")
+        for name in (
+            "moe_use_legacy_grouped_gemm",
+            "sequence_parallel",
+            "use_te_op_fuser",
+            "use_transformer_engine_op_fuser",
+            "use_grouped_gemm_for_dense_mlp",
+            "cuda_graph_impl",
+            "use_torch_fsdp2",
+            "use_custom_fsdp",
+        ):
+            if option(config, name, False, fallback) not in (False, None, "none"):
+                raise ValueError(f"FP4 reference consumer does not support {name}")
+        if option(config, "turbo_sync_free_moe_stage", 0, fallback):
+            raise ValueError("FP4 reference consumer requires turbo_sync_free_moe_stage=0")
+        if module_kind == "grouped" and not _boolean(
+            option(config, "moe_grouped_gemm", True, fallback), "moe_grouped_gemm"
+        ):
+            raise ValueError("FP4 reference MoE requires moe_grouped_gemm=true")
+        if _boolean(option(config, "weight_deosc", False, fallback), "weight_deosc"):
+            for name in ("data_parallel_size", "world_size"):
+                if option(config, name, 1, fallback) != 1:
+                    raise ValueError("Reference FP4 DeOsc currently requires DP1/full FP32 master parameters")
+            for name in ("use_precision_aware_optimizer", "reuse_grad_buf_for_mxfp4_param_ag"):
+                if _boolean(option(config, name, False, fallback), name):
+                    raise ValueError(f"Reference FP4 DeOsc does not support {name}")
     # These producers/optimizer hooks embed MXFP4 assumptions even when the
     # GEMM itself is delegated to TE. Guard them for BOTH new-format routes.
     for name in (
         "turbo_fused_grouped_gemm",
         "moe_permute_quant_fusion",
         "moe_backward_permute_quant_fusion",
-        "weight_deosc",
         "weight_deosc_fusion",
         "weight_deosc_direct_qdq",
         "use_turbo_mega_moe",
@@ -135,6 +157,8 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
     ):
         if _boolean(option(config, name, False, fallback), name):
             raise ValueError(f"{name} is not wired for {recipe.recipe}; disable it for two-level FP4")
+    if backend == "te" and _boolean(option(config, "weight_deosc", False, fallback), "weight_deosc"):
+        raise ValueError("weight_deosc is only wired for fp4_backend=reference, not TE NVFP4")
     for name in (
         "PRIMUS_FUSED_RMSNORM_MXFP4_QKV",
         "PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT",
@@ -187,8 +211,8 @@ def fp4_recipe_context(plan):
 def module_fp4_context(qrecipe, options, module_kind="dense", quantized=False):
     """Respect TE module override flags before selecting a new recipe.
 
-    Used by the Turbo module boundary. Native TE modules have their own context;
-    selecting TE here is an error because it would leave a Turbo GEMM consumer.
+    Used by the reference module boundary. Native TE modules have their own
+    context; metadata alone cannot turn a reference module into a TE consumer.
     """
     from contextlib import nullcontext
 
@@ -205,6 +229,6 @@ def module_fp4_context(qrecipe, options, module_kind="dense", quantized=False):
     merged["fp4_recipe"] = selected
     plan = resolve_fp4_plan(merged, module_kind)
     if plan.backend == "te":
-        raise ValueError("TE NVFP4 must use TE modules, not the Turbo per-module override")
+        raise ValueError("TE NVFP4 must use TE modules, not the reference per-module override")
     plan.require_execution()
     return fp4_recipe_context(plan)

@@ -1,4 +1,4 @@
-# P0 option fragment for tools/fp4_preflight.py, NOT a runnable training recipe.
+# Reference option fragment for tools/fp4_preflight.py; not a full training recipe.
 fp4: e2m1
 fp4_recipe: nvfp4
 fp4_backend: reference
@@ -18,8 +18,9 @@ tensor_model_parallel_size: 1
 expert_model_parallel_size: 1
 num_experts: 32
 enable_primus_turbo: true
-use_turbo_gemm: true
-use_turbo_grouped_gemm: true
+use_turbo_gemm: false
+use_turbo_grouped_gemm: false
+moe_grouped_gemm: true
 turbo_fused_grouped_gemm: false
 moe_permute_quant_fusion: false
 moe_backward_permute_quant_fusion: false

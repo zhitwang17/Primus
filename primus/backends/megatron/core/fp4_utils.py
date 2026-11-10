@@ -386,12 +386,12 @@ def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool
         return _legacy_get_fp4_context(config, layer_no, is_init)
     enabled = option(config, "fp4_param", False) if is_init else option(config, "fp4", False)
     if not enabled:
-        return nullcontext()
+        return fp4_recipe_context(None)
     if layer_no >= 0 and option(config, "first_last_layers_bf16", False):
         if layer_no < option(config, "num_layers_at_start_in_bf16", 0) or layer_no >= (
             config.num_layers - option(config, "num_layers_at_end_in_bf16", 0)
         ):
-            return nullcontext()
+            return fp4_recipe_context(None)
     fallback = _fp4_global_options()
     plan = resolve_fp4_plan(config, fallback=fallback, environ=os.environ)
     # A grouped Turbo consumer is incompatible even when dense linears use TE.

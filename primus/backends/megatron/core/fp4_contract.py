@@ -64,7 +64,7 @@ class TwoLevelFP4Config:
         if self.block_size != 16 or isinstance(self.block_size, bool):
             raise ValueError("NVFP4/AMDFP4 inner block_size must be 16")
         if self.outer_scope != "tensor" or self.inner_storage != "float32_grid":
-            raise ValueError("P0 contract supports tensor outer scope and float32_grid inner storage")
+            raise ValueError("Reference contract supports tensor outer scope and float32_grid inner storage")
         if type(self.rht_size) is not int or self.rht_size not in (0, 16, 32):
             raise ValueError("rht_size must be 0 (disabled), 16, or 32")
         if type(self.rng_seed) is not int or not 0 <= self.rng_seed < 2**63:
@@ -271,9 +271,10 @@ class TwoLevelFP4Tensor:
 class FP4RandomState:
     """Private counter reservations; no consumption of global Torch/Python RNG.
 
-    P1 quantizers must map reserved blocks to their Philox implementation and
-    reuse the same RHT reservation for BOTH wgrad operands. A reservation does
-    not itself generate random numbers or establish GPU RNG parity.
+    The reference backend maps reservations to private CPU generators; a future
+    native Philox implementation needs a distinct checkpoint identity. Both
+    wgrad operands must share the same RHT reservation. Reservations alone do
+    not generate random numbers or establish parity with another backend.
     """
 
     recipe_fingerprint: str

@@ -57,9 +57,8 @@ def test_recipe_fragment_and_routes(recipe, inner, maximum, floor):
     cfg = D.build_two_level_config(options(recipe))
     assert (cfg.inner_format, cfg.inner_max, cfg.inner_floor) == (inner, maximum, floor)
     assert C.TwoLevelFP4Config(**json.loads(json.dumps(cfg.to_dict()))) == cfg
-    assert all(r["execution_status"] == "P1 consumer required" for r in result["routes"])
-    with pytest.raises(NotImplementedError, match="P1 Megatron QDQ"):
-        D.validate_fp4_options(options(recipe))
+    assert all(r["execution_status"] == "QDQ reference consumer" for r in result["routes"])
+    assert len(D.validate_fp4_options(options(recipe))) == 2
 
 
 @pytest.mark.parametrize(
@@ -73,9 +72,9 @@ def test_recipe_fragment_and_routes(recipe, inner, maximum, floor):
         {"fp4_gradient_sr": "invalid"},
         {"fp4_backend": "typo"},
         {"fp4_backend": "turbo"},
-        {"fp4_backend": "te"},
+        {"fp4_backend": "te", "use_turbo_gemm": True},
         {"turbo_fused_grouped_gemm": True},
-        {"weight_deosc": True},
+        {"weight_deosc": True, "data_parallel_size": 2},
         {"weight_deosc_direct_qdq": True},
         {"moe_permute_quant_fusion": True},
         {"moe_backward_permute_quant_fusion": True},
@@ -107,7 +106,7 @@ def test_incompatible_fused_environment(key):
 
 def test_dense_and_grouped_backend_checks_and_legacy_mxfp4():
     assert D.validate_fp4_options({"fp4": "e2m1", "fp4_recipe": "mxfp4"}) == ()
-    args = options(fp4_backend="auto", use_turbo_gemm=False)
+    args = options(fp4_backend="auto", use_turbo_gemm=False, use_turbo_grouped_gemm=True)
     assert D.resolve_fp4_plan(args, "dense").backend == "te"
     with pytest.raises(ValueError, match="Turbo grouped"):
         D.validate_fp4_options(args, require_runtime=False)
@@ -262,8 +261,8 @@ def test_context_nesting_override_and_restore_after_error():
             assert D.current_fp4_plan() is None
         assert D.current_fp4_plan() is nv
         override = {"override_quantized_autocast": True, "fp4_quantization_recipe": "amdfp4"}
-        with pytest.raises(NotImplementedError, match="amdfp4"):
-            D.module_fp4_context(override, options())
+        with D.module_fp4_context(override, options()):
+            assert D.current_fp4_plan().config.recipe == "amdfp4"
     assert D.current_fp4_plan() is None
 
 
@@ -315,8 +314,9 @@ def test_real_config_builder_and_context_hook_without_gpu_stack(fp4_utils, recip
     config = SimpleNamespace(fp4_recipe=recipe, fp4="e2m1")
     quant, error = fp4_utils.get_fp4_quant_config(config)
     assert isinstance(quant, C.TwoLevelFP4Config) and quant.recipe == recipe and error == ""
-    with pytest.raises(NotImplementedError, match="P1"):
-        fp4_utils.get_fp4_context(config)
+    with fp4_utils.get_fp4_context(config):
+        assert D.current_fp4_plan().config.recipe == recipe
+    assert D.current_fp4_plan() is None
     with fp4_utils.get_fp4_context(config, is_init=True):
         pass  # BF16 model parameter initialization remains unquantized.
     config.fp4_backend = "te"
@@ -329,11 +329,11 @@ def test_real_config_builder_and_context_hook_without_gpu_stack(fp4_utils, recip
             fp4_utils.get_fp4_context(config)
 
 
-def test_real_rocm_validation_hook_rejects_missing_consumer(fp4_utils, monkeypatch):
+def test_real_rocm_validation_hook_rejects_unsupported_fusion(fp4_utils, monkeypatch):
     package(monkeypatch, "primus.core.utils.logger", info_with_caller=lambda *a: None)
     rocm = load_file("_fp4_test_rocm", ROOT / "primus/backends/megatron/patches/args/rocm_arg_validation.py")
-    args = SimpleNamespace(**options(deterministic_mode=False))
-    with pytest.raises(NotImplementedError, match="P1"):
+    args = SimpleNamespace(**options(deterministic_mode=False, weight_deosc_direct_qdq=True))
+    with pytest.raises(ValueError, match="weight_deosc_direct_qdq"):
         rocm.validate_args_on_rocm(args)
 
 
@@ -423,7 +423,7 @@ def test_actual_per_module_hook_gates_new_formats_and_preserves_bf16(fp4_utils):
     )
     assert fn(q) is marker
     q.fp4_quantization_recipe = "amdfp4"
-    with pytest.raises(NotImplementedError, match="amdfp4"):
+    with pytest.raises(ValueError, match="reference spec provider"):
         fn(q)
     q.override_quantized_autocast = False
     with fn(q):

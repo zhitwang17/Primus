@@ -44,7 +44,7 @@ def inspect_options(options, environ=None):
     if not plans:
         raise ValueError("Preflight requires an NVFP4 or AMDFP4 option fragment")
     return {
-        "scope": "P0 configuration/metadata only; no model, quantizer or GEMM execution",
+        "scope": "Configuration/metadata inspection only; no model, quantizer or GEMM execution",
         "routes": [p.to_dict() for p in plans],
         "operands": {
             p.config.recipe: [

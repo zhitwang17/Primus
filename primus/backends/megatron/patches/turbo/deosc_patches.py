@@ -24,7 +24,9 @@ def _is_weight_deosc_can_patch(ctx: PatchContext) -> bool:
     args = get_args(ctx)
     fp4 = bool(getattr(args, "fp4", False))
     deosc = bool(getattr(args, "weight_deosc", False))
-    return fp4 and deosc and is_primus_turbo_can_patch(ctx)
+    recipe = getattr(args, "fp4_recipe", None)
+    recipe = getattr(recipe, "value", recipe)
+    return fp4 and deosc and recipe == "mxfp4" and is_primus_turbo_can_patch(ctx)
 
 
 @register_patch(

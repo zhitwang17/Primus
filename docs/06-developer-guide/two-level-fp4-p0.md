@@ -1,5 +1,9 @@
 # NVFP4 / AMDFP4 P0 integration
 
+Historical P0 record. The subsequent [reference adapter implementation](two-level-fp4-reference.md)
+now supplies executable dense/MoE QDQ, DeOsc/state handling and reduced-model GPU
+smoke. The missing-consumer status below describes the original P0 commit.
+
 Date: 2026-11-10. Branch: `train/nvfp4-amdfp4-gpt-oss`, based on Primus
 `865846318716b73136fca49bc7b1b44447cafd57`.
 
