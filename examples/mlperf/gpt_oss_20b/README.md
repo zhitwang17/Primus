@@ -130,11 +130,13 @@ pool.
 
 ### FP8 recipe
 
-Override `EXP` to switch from the default MXFP4 yaml. The config derives the
-learning-rate schedule and the MLLOG precision from the yaml name:
+Override `EXP` and set `PRIMUS_LINEAR_PRECISION` to switch from the default MXFP4 yaml.
+Custom experiment paths require explicit precision; filenames do not select the
+learning-rate schedule or MLLOG precision. Explicit LR/warmup overrides are preserved:
 
 ```bash
 export EXP=/workspace/Primus/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-turbo-attn-mlperf-pretrain.yaml
+export PRIMUS_LINEAR_PRECISION=fp8
 bash examples/mlperf/gpt_oss_20b/run_with_docker.sh
 ```
 

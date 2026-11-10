@@ -8,31 +8,42 @@ export NODE_RANK=0
 export MASTER_ADDR=localhost
 export MASTER_PORT=29501
 
-export PRIMUS_PATH=/workspace/Primus
+export PRIMUS_PATH="${PRIMUS_PATH:-/workspace/Primus}"
 export PRIMUS_MLPERF=1
 export PYTHONPATH="${PRIMUS_PATH}:${PRIMUS_PATH}/third_party/Megatron-LM:${PYTHONPATH:-}"
-# MXFP4 + de-oscillation is the default recipe. For the FP8 recipe:
+# MXFP4 + de-oscillation is the default recipe. For the FP8 recipe also set:
+#   export PRIMUS_LINEAR_PRECISION=fp8
 #   export EXP=${PRIMUS_PATH}/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-turbo-attn-mlperf-pretrain.yaml
-export EXP="${EXP:-${PRIMUS_PATH}/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-MXFP4-deosc-mlperf-pretrain.yaml}"
-export DATA_PATH=/data
-if [[ "${EXP}" == *MXFP4* ]]; then
-    _linear_precision=mxfp4
-else
-    _linear_precision=fp8
+_default_exp="${PRIMUS_PATH}/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-MXFP4-deosc-mlperf-pretrain.yaml"
+if [[ -z "${PRIMUS_LINEAR_PRECISION:-}" && -n "${EXP:-}" && "${EXP}" != "${_default_exp}" ]]; then
+    echo "Custom EXP requires explicit PRIMUS_LINEAR_PRECISION=mxfp4|nvfp4|amdfp4|fp8; precision is not inferred from filenames." >&2
+    if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 2; else return 2; fi
 fi
+export EXP="${EXP:-${_default_exp}}"
+export PRIMUS_LINEAR_PRECISION="${PRIMUS_LINEAR_PRECISION:-mxfp4}"
+case "${PRIMUS_LINEAR_PRECISION}" in
+    mxfp4|nvfp4|amdfp4|fp8) ;;
+    *)
+        echo "Unsupported PRIMUS_LINEAR_PRECISION=${PRIMUS_LINEAR_PRECISION}" >&2
+        if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 2; else return 2; fi
+        ;;
+esac
+_linear_precision="${PRIMUS_LINEAR_PRECISION}"
+unset _default_exp
+export DATA_PATH=/data
 
 export PRIMUS_MICRO_BATCH_SIZE=4
 export PRIMUS_GLOBAL_BATCH_SIZE=32
 # MXFP4 schedule: min LR is 10% of max LR.
 # The FP8 yaml still defaults to 8e-4 when PRIMUS_LR is not exported.
-if [[ "${_linear_precision}" == mxfp4 ]]; then
-    export PRIMUS_LR=5.7e-4
-    export PRIMUS_MIN_LR=5.7e-5
-    export PRIMUS_LR_WARMUP_ITERS=117
+if [[ "${_linear_precision}" != fp8 ]]; then
+    export PRIMUS_LR="${PRIMUS_LR:-5.7e-4}"
+    export PRIMUS_MIN_LR="${PRIMUS_MIN_LR:-5.7e-5}"
+    export PRIMUS_LR_WARMUP_ITERS="${PRIMUS_LR_WARMUP_ITERS:-117}"
 else
-    export PRIMUS_LR=4.0e-4
-    export PRIMUS_MIN_LR=4.0e-5
-    export PRIMUS_LR_WARMUP_ITERS=128
+    export PRIMUS_LR="${PRIMUS_LR:-4.0e-4}"
+    export PRIMUS_MIN_LR="${PRIMUS_MIN_LR:-4.0e-5}"
+    export PRIMUS_LR_WARMUP_ITERS="${PRIMUS_LR_WARMUP_ITERS:-128}"
 fi
 export PRIMUS_TRAIN_ITERS=1200000
 export PRIMUS_LR_DECAY_ITERS=$((PRIMUS_TRAIN_ITERS - PRIMUS_LR_WARMUP_ITERS))

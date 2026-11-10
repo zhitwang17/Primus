@@ -36,13 +36,22 @@ def _is_fp4_enabled(ctx: PatchContext) -> bool:
     condition=_is_fp4_enabled,
 )
 def patch_enums(ctx: PatchContext):
+    import sys
+
     from megatron.core import enums
 
     from primus.backends.megatron.core.enums import Fp4Recipe
 
     log_rank_0("[Patch:megatron.core.enums] Overriding enums for fp4=True")
 
+    previous = enums.Fp4Recipe
     enums.Fp4Recipe = Fp4Recipe
+    # TEQuantizationRecipe and TransformerConfig may already hold an imported
+    # enum alias. Rebind only aliases to this exact upstream type, so parsing
+    # per-module AMDFP4 recipes uses the same enum as the global recipe.
+    for name, module in list(sys.modules.items()):
+        if name.startswith("megatron.") and getattr(module, "Fp4Recipe", None) is previous:
+            module.Fp4Recipe = Fp4Recipe
     log_rank_0(f"[Patch:megatron.core.enums]   Patched {enums.__name__}.Fp4Recipe")
 
 

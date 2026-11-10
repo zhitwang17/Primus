@@ -64,6 +64,17 @@ inference_rng_tracker: false
 fp4: null
 fp4_recipe: nvfp4
 fp4_param_gather: false
+# Two-level reference contract. P0 only; dense/grouped QDQ consumers follow in P1.
+# auto preserves existing MXFP4 / TE NVFP4 routing; AMDFP4 requires reference.
+fp4_backend: auto # auto, reference, te, turbo
+fp4_block_size: 16
+fp4_weight_2d: true
+fp4_outer_scope: tensor
+fp4_inner_storage: float32_grid
+fp4_rht_size: 32
+fp4_rht_randomized: true
+fp4_gradient_sr: true
+fp4_rng_seed: null # defaults to training seed; private SR/RHT counter streams
 
 first_last_layers_bf16: false
 num_layers_at_start_in_bf16: 1

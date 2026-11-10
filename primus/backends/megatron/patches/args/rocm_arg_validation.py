@@ -17,6 +17,7 @@ import os
 
 import torch
 
+from primus.backends.megatron.core.fp4_dispatch import validate_fp4_options
 from primus.core.utils import logger
 from primus.core.utils.module_utils import warning_rank_0
 
@@ -217,12 +218,9 @@ def validate_args_on_rocm(args):
             args.fp8_recipe in support_fp8_recipe
         ), f"{args.fp8_recipe} recipe is not support when enable `use_turbo_gemm`."
 
-    # Turbo FP4 linear check
-    if args.fp4 and use_turbo_gemm:
-        support_fp4_recipe = ["mxfp4"]
-        assert (
-            args.fp4_recipe in support_fp4_recipe
-        ), f"{args.fp4_recipe} recipe is not support when enable `use_turbo_gemm`."
+    # Check both dense and grouped consumers, not just the dense Turbo flag.
+    # Reference recipes have a P0 contract but no P1 training consumer yet.
+    validate_fp4_options(args, environ=os.environ)
 
     # Turbo FP4 autocast check: PrimusTurboLinear quantizes only under the Turbo
     # autocast, which the TE-native path never enters. Local specs quantize
@@ -286,6 +284,8 @@ def validate_args_on_rocm(args):
         )
 
     validate_turbo_grouped_gemm_without_padding(args)
+    # Sync-free MoE can enable a grouped consumer after the first validation.
+    validate_fp4_options(args, environ=os.environ)
     validate_turbo_grouped_gemm_with_muon(args)
     validate_turbo_fp8_permute(args)
     # After sync-free MoE, which may auto-enable use_turbo_grouped_gemm.

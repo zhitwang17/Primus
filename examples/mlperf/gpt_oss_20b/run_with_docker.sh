@@ -174,6 +174,8 @@ if [[ -n "${EXP:-}" ]]; then
     _extra_env+=("--env=EXP=${EXP}")
 fi
 for _precision_env in \
+    PRIMUS_LINEAR_PRECISION \
+    PRIMUS_LR PRIMUS_MIN_LR PRIMUS_LR_WARMUP_ITERS \
     MLLOG_LOWEST_NUMERICAL_PRECISION_IN_LINEAR \
     MLLOG_LOWEST_NUMERICAL_PRECISION_IN_ATTN \
     MLLOG_LOWEST_NUMERICAL_PRECISION_IN_COMM; do
@@ -213,24 +215,32 @@ fi
 # Export values from config_${DGXSYSTEM}.sh for docker exec. The config derives
 # recipe-specific settings from these host selectors, so they are visible to it.
 _config_selectors=()
-for _selector_env in EXP MEGATRON_GRAD_REDUCE_BACKEND PRIMUS_USE_PRECISION_AWARE_OPTIMIZER \
+for _selector_env in EXP PRIMUS_LINEAR_PRECISION PRIMUS_LR PRIMUS_MIN_LR PRIMUS_LR_WARMUP_ITERS \
+    MEGATRON_GRAD_REDUCE_BACKEND PRIMUS_USE_PRECISION_AWARE_OPTIMIZER \
     PRIMUS_REBUILD_RCCL PRIMUS_RCCL_REF PRIMUS_RCCL_GPU_ARCHS; do
     if [[ -n "${!_selector_env:-}" ]]; then
         _config_selectors+=("${_selector_env}=${!_selector_env}")
     fi
 done
-mapfile -t _config_env < <(
-    env -i HOME="${HOME}" PATH="${PATH}" "${_config_selectors[@]}" bash -c "
+if ! _config_export_text=$(
+    # Positional parameters are deliberately expanded by the child bash.
+    # shellcheck disable=SC2016
+    env -i HOME="${HOME}" PATH="${PATH}" "${_config_selectors[@]}" bash -c '
         set -a
-        source '${_config_file}'
+        source "$1" || exit
         set +a
         env
-    " | grep -E -v '^(PWD|SHLVL|_|OLDPWD)=' || true
-)
+    ' config-export "${_config_file}"
+); then
+    echo "Failed to resolve GPT-OSS configuration; refusing to launch." >&2
+    exit 2
+fi
+mapfile -t _config_env <<< "${_config_export_text}"
+unset _config_export_text
 _config_docker_env=()
 for v in "${_config_env[@]}"; do
     # Never override container PATH/PYTHONHOME from a host-side config source.
-    case "${v}" in PATH=*|PYTHONHOME=*|HOME=* ) continue ;; esac
+    case "${v}" in PATH=*|PYTHONHOME=*|HOME=*|PWD=*|SHLVL=*|_=*|OLDPWD=* ) continue ;; esac
     _config_docker_env+=("--env=${v}")
 done
 

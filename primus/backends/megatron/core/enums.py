@@ -8,7 +8,9 @@ import enum
 
 
 class Fp4Recipe(str, enum.Enum):
-    """FP4 recipe names: nvfp4, mxfp4."""
+    """FP4 recipe identity, independent of available execution backends."""
 
     nvfp4 = "nvfp4"
     mxfp4 = "mxfp4"
+    amdfp4 = "amdfp4"
+    custom = "custom"

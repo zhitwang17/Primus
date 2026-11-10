@@ -338,3 +338,74 @@ else:
     def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return nullcontext when Transformer Engine is not available."""
         return nullcontext()
+
+
+# Keep the existing MXFP4/TE implementations above intact. Two-level reference
+# selection must also work when TE/Turbo are not installed (CPU preflight), and
+# must never disappear into the no-TE nullcontext fallback during execution.
+_legacy_get_fp4_context = get_fp4_context
+_legacy_get_fp4_quant_config = globals().get("get_fp4_quant_config")
+
+
+def _fp4_global_options():
+    try:
+        from megatron.training.global_vars import get_args
+
+        return get_args()
+    except (ImportError, AssertionError, RuntimeError):
+        return None
+
+
+def get_fp4_quant_config(config: TransformerConfig):
+    from primus.backends.megatron.core.fp4_dispatch import (
+        build_two_level_config,
+        is_two_level,
+        option,
+    )
+
+    fallback = _fp4_global_options()
+    if is_two_level(config) and option(config, "fp4_backend", "auto", fallback) == "reference":
+        return build_two_level_config(config, fallback), ""
+    if _legacy_get_fp4_quant_config is not None:
+        return _legacy_get_fp4_quant_config(config)
+    return None, "Primus-Turbo FP4 quant config is unavailable; no fallback backend was selected."
+
+
+def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+    import copy
+    import os
+
+    from primus.backends.megatron.core.fp4_dispatch import (
+        fp4_recipe_context,
+        is_two_level,
+        option,
+        resolve_fp4_plan,
+    )
+
+    if not is_two_level(config):
+        return _legacy_get_fp4_context(config, layer_no, is_init)
+    enabled = option(config, "fp4_param", False) if is_init else option(config, "fp4", False)
+    if not enabled:
+        return nullcontext()
+    if layer_no >= 0 and option(config, "first_last_layers_bf16", False):
+        if layer_no < option(config, "num_layers_at_start_in_bf16", 0) or layer_no >= (
+            config.num_layers - option(config, "num_layers_at_end_in_bf16", 0)
+        ):
+            return nullcontext()
+    fallback = _fp4_global_options()
+    plan = resolve_fp4_plan(config, fallback=fallback, environ=os.environ)
+    # A grouped Turbo consumer is incompatible even when dense linears use TE.
+    if option(config, "num_moe_experts", option(fallback, "num_experts", 0)):
+        resolve_fp4_plan(config, "grouped", fallback, os.environ).require_execution()
+    plan.require_execution()
+    if plan.backend == "reference":
+        return fp4_recipe_context(plan)
+    if not HAVE_TE:
+        raise RuntimeError("NVFP4 TE backend selected, but Transformer Engine is unavailable")
+    te_config = copy.copy(config)
+    te_config.fp4_use_native_te_autocast = True
+    recipe_result = get_fp4_recipe(te_config)
+    te_recipe, reason = recipe_result if isinstance(recipe_result, tuple) else (recipe_result, "unavailable")
+    if te_recipe is None:
+        raise RuntimeError(f"NVFP4 TE recipe unavailable: {reason}; refusing disabled autocast fallback")
+    return _legacy_get_fp4_context(te_config, layer_no, is_init)

@@ -869,6 +869,17 @@ def primus_turbo_fp4_autocast(
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    from primus.backends.megatron.core.fp4_dispatch import (
+        current_fp4_plan,
+        module_fp4_context,
+    )
+
+    if current_fp4_plan() is not None or qrecipe.fp4_quantization_recipe in ("nvfp4", "amdfp4"):
+        return module_fp4_context(
+            qrecipe,
+            get_args(),
+            quantized=FP8GlobalStateManager.is_fp8_enabled() or _is_fp4_or_fp8_enabled(),
+        )
     # Decide from the same state the Turbo forward will consult. The Turbo GEMM
     # branch is chosen from the Turbo fp8/fp4 flags, and those stay on in places
     # where TE's own flag no longer is: inside an MXFP4 layer, once the QKV
@@ -930,9 +941,7 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             )
         else:
             # Fp4 configured.
-            if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
-                assert False, "NVFP4 is not supported for Primus-Turbo"
-            elif qrecipe.fp4_quantization_recipe == Fp4Recipe.mxfp4:
+            if qrecipe.fp4_quantization_recipe == Fp4Recipe.mxfp4:
                 from primus.backends.megatron.core.fp4_utils import (
                     MXFP4_SCALING_BLOCK_SIZE,
                 )
