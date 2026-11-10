@@ -79,6 +79,7 @@ def modules(monkeypatch):
     prefix = "primus.backends.megatron.core"
     contract = load(prefix + ".fp4_contract", CORE / "fp4_contract.py")
     load(prefix + ".fp4_reference", CORE / "fp4_reference.py")
+    load(prefix + ".fp4_backend", CORE / "fp4_backend.py")
     dispatch = load(prefix + ".fp4_dispatch", CORE / "fp4_dispatch.py")
     autograd = load(prefix + ".fp4_autograd", CORE / "fp4_autograd.py")
     impl = load(prefix + ".extensions.two_level_fp4", CORE / "extensions/two_level_fp4.py")

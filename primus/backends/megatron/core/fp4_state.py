@@ -63,7 +63,7 @@ def bind_fp4_model(models, rank=None):
         for config in module.fp4_configs:
             if config.fingerprint not in states:
                 states[config.fingerprint] = FP4RandomState.for_config(
-                    config, stream + "/" + config.fingerprint
+                    config, stream + "/" + config.rng_fingerprint
                 )
         module.fp4_rngs = states
         module.fp4_rng = states[module.fp4_config.fingerprint]
@@ -133,7 +133,7 @@ def load_fp4_state_dict(models, state, optimizer=None, *, rank=None):
             raise ValueError(f"FP4 checkpoint {name} RNG set mismatch")
         rngs = {
             key: FP4RandomState.from_state_dict(
-                checkpoint["rng"][key], config, module.fp4_stream_id + "/" + key
+                checkpoint["rng"][key], config, module.fp4_stream_id + "/" + config.rng_fingerprint
             )
             for key, config in configs.items()
         }

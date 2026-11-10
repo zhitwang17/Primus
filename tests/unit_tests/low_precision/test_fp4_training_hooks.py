@@ -67,6 +67,7 @@ def hooks(monkeypatch, tmp_path):
     prefix = "primus.backends.megatron.core"
     contract = load(prefix + ".fp4_contract", CORE / "fp4_contract.py")
     load(prefix + ".fp4_reference", CORE / "fp4_reference.py")
+    load(prefix + ".fp4_backend", CORE / "fp4_backend.py")
     load(prefix + ".fp4_dispatch", CORE / "fp4_dispatch.py")
     state = load(prefix + ".fp4_state", CORE / "fp4_state.py")
     deosc = load(prefix + ".optimizer.two_level_fp4_deosc", CORE / "optimizer/two_level_fp4_deosc.py")

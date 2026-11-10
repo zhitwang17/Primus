@@ -43,6 +43,7 @@ def build_two_level_config(config, fallback=None):
         "rht_randomized": ("fp4_rht_randomized", True),
         "gradient_sr": ("fp4_gradient_sr", True),
         "rng_seed": ("fp4_rng_seed", option(config, "seed", 1234, fallback)),
+        "quantizer": ("fp4_quantizer", "torch"),
     }
     return TwoLevelFP4Config(
         recipe=_name(option(config, "fp4_recipe", fallback=fallback)),
@@ -99,6 +100,8 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
     if option(config, "transformer_impl", "transformer_engine", fallback) != "transformer_engine":
         raise ValueError("Two-level FP4 routing requires transformer_impl=transformer_engine")
     if backend == "te":
+        if recipe.quantizer != "torch":
+            raise ValueError("fp4_quantizer=triton requires fp4_backend=reference; TE owns its quantizer")
         if recipe.recipe != "nvfp4":
             raise ValueError("Transformer Engine has no AMDFP4 recipe")
         if turbo_consumer:
@@ -139,8 +142,10 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
             raise ValueError("FP4 reference MoE requires moe_grouped_gemm=true")
         if _boolean(option(config, "weight_deosc", False, fallback), "weight_deosc"):
             for name in ("data_parallel_size", "world_size"):
-                if option(config, name, 1, fallback) != 1:
-                    raise ValueError("Reference FP4 DeOsc currently requires DP1/full FP32 master parameters")
+                if option(config, name, 1, fallback) != 1 and _boolean(
+                    option(config, "use_distributed_optimizer", False, fallback), "use_distributed_optimizer"
+                ):
+                    raise ValueError("FP4 DeOsc with DP>1 requires replicated full FP32 masters")
             for name in ("use_precision_aware_optimizer", "reuse_grad_buf_for_mxfp4_param_ag"):
                 if _boolean(option(config, name, False, fallback), name):
                     raise ValueError(f"Reference FP4 DeOsc does not support {name}")

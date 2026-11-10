@@ -1,43 +1,125 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""Single-GPU, reduced Megatron GPTModel smoke for two-level FP4 adapters.
+"""One/two-GPU Megatron GPTModel smoke for two-level FP4 adapters.
 
 This exercises real model/optimizer/DDP paths on synthetic tokens. It is not a
-convergence or performance benchmark, and does not use FlyDSL attention. Expose
-exactly one GPU to the process before invoking this script.
+convergence or throughput benchmark, and does not use FlyDSL attention. The
+gpt-oss profile retains the original hidden/head/expert geometry; only depth,
+sequence, batch and vocabulary are reduced. Use torchrun for two replicated DP
+ranks, one visible GPU per local rank.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
+import hashlib
+import io
 import json
 import os
 import platform
 import sys
 import tempfile
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 
-def parse_args():
+def model_geometry(profile, num_layers=None):
+    """Pinned Primus gpt_oss_20B.yaml geometry, independent of GPU imports."""
+    if profile == "gpt-oss":
+        layers = 1 if num_layers is None else num_layers
+        return dict(
+            layers=layers,
+            hidden_size=2880,
+            attention_heads=64,
+            query_groups=8,
+            kv_channels=64,
+            num_experts=32,
+            topk=4,
+            ffn_hidden_size=2880,
+            layer_pattern=[1] * layers,
+        )
+    if profile != "tiny":
+        raise ValueError(f"Unknown model profile: {profile}")
+    layers = 2 if num_layers is None else num_layers
+    return dict(
+        layers=layers,
+        hidden_size=128,
+        attention_heads=2,
+        query_groups=1,
+        kv_channels=64,
+        num_experts=4,
+        topk=2,
+        ffn_hidden_size=128,
+        layer_pattern=[0] * (layers - 1) + [1],
+    )
+
+
+def _source_fingerprints():
+    root = Path(__file__).resolve().parents[1]
+    files = [
+        "tools/fp4_smoke.py",
+        *[
+            f"primus/backends/megatron/core/{name}.py"
+            for name in (
+                "fp4_contract",
+                "fp4_dispatch",
+                "fp4_reference",
+                "fp4_backend",
+                "fp4_triton",
+                "fp4_autograd",
+                "fp4_state",
+                "fp4_checkpoint",
+                "optimizer/two_level_fp4_deosc",
+                "extensions/two_level_fp4",
+            )
+        ],
+        "primus/backends/megatron/patches/two_level_fp4_patches.py",
+        "third_party/Megatron-LM/megatron/core/transformer/moe/moe_utils.py",
+    ]
+    return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in files}
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--recipe", choices=("nvfp4", "amdfp4"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--seq-length", type=int, choices=(32, 64), default=64)
+    parser.add_argument("--model-profile", choices=("tiny", "gpt-oss"), default="tiny")
+    parser.add_argument("--num-layers", type=int, choices=(1, 2), default=None)
+    parser.add_argument("--seq-length", type=int, choices=(16, 32, 64, 128), default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--vocab-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
+    parser.add_argument("--checkpoint-format", choices=("bundle", "torch_dist"), default="bundle")
+    parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--glu-clamp", type=float, default=None)
     parser.add_argument("--glu-offset", type=float, default=0.0)
     parser.add_argument("--deosc", action="store_true")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Require deterministic Torch/Megatron operations for exact checkpoint replay",
+    )
     parser.add_argument("--recompute", action="store_true", help="Exercise full-layer activation recompute")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.seq_length = args.seq_length or (32 if args.model_profile == "gpt-oss" else 64)
+    args.batch_size = (
+        args.batch_size if args.batch_size is not None else (1 if args.model_profile == "gpt-oss" else 2)
+    )
+    args.lr = args.lr if args.lr is not None else (5.7e-4 if args.model_profile == "gpt-oss" else 0.002)
     if args.steps < 2 or (args.deosc and args.steps < 4):
         parser.error("checkpoint smoke needs at least two updates; DeOsc needs at least four")
     if args.glu_clamp is not None and args.glu_clamp <= 0:
         parser.error("glu-clamp must be positive")
+    if args.batch_size <= 0 or args.vocab_size < 8 or args.vocab_size % 8 or args.lr <= 0:
+        parser.error("batch-size/lr must be positive and vocab-size must be a positive multiple of eight")
     return args
 
 
@@ -48,17 +130,18 @@ def _make_config(args):
 
     from primus.backends.megatron.core.enums import Fp4Recipe
 
+    geometry = model_geometry(args.model_profile, args.num_layers)
     config = TransformerConfig(
-        num_layers=2,
-        hidden_size=128,
-        num_attention_heads=2,
-        num_query_groups=1,
-        kv_channels=64,
-        ffn_hidden_size=128,
-        num_moe_experts=4,
-        moe_ffn_hidden_size=128,
-        moe_layer_freq=[0, 1],
-        moe_router_topk=2,
+        num_layers=geometry["layers"],
+        hidden_size=geometry["hidden_size"],
+        num_attention_heads=geometry["attention_heads"],
+        num_query_groups=geometry["query_groups"],
+        kv_channels=geometry["kv_channels"],
+        ffn_hidden_size=geometry["ffn_hidden_size"],
+        num_moe_experts=geometry["num_experts"],
+        moe_ffn_hidden_size=geometry["ffn_hidden_size"],
+        moe_layer_freq=geometry["layer_pattern"],
+        moe_router_topk=geometry["topk"],
         moe_router_pre_softmax=False,
         moe_router_load_balancing_type="none",
         moe_aux_loss_coeff=0.0,
@@ -100,14 +183,119 @@ def _make_config(args):
         recompute_granularity="full" if args.recompute else None,
         recompute_method="uniform" if args.recompute else None,
         recompute_num_layers=1 if args.recompute else None,
+        deterministic_mode=args.deterministic,
     )
     # Primus options are not dataclass fields in upstream TransformerConfig.
     config.fp4_backend = "reference"
     config.fp4_rng_seed = args.seed
+    config.fp4_quantizer = args.quantizer
     config.enable_primus_turbo = False
     config.use_turbo_gemm = False
     config.use_turbo_grouped_gemm = False
     return config
+
+
+_CHECK_CHUNK_ELEMENTS = 4 * 1024 * 1024
+
+
+def _tensor_chunks(tensor):
+    flat = tensor.detach().reshape(-1)
+    for begin in range(0, flat.numel(), _CHECK_CHUNK_ELEMENTS):
+        yield flat[begin : begin + _CHECK_CHUNK_ELEMENTS]
+
+
+def _state_fingerprint(value):
+    """Hash every tensor byte and structural metadata using bounded host copies.
+
+    Large geometry replay must not retain two complete GPU models or two sets of
+    Adam/DeOsc state. SHA256 lets the first training objects be released before
+    fresh construction while checking all values, including zero gradients.
+    """
+    import torch
+
+    digest = hashlib.sha256()
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            digest.update(f"tensor:{item.dtype}:{tuple(item.shape)}:".encode())
+            for chunk in _tensor_chunks(item):
+                digest.update(chunk.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        elif isinstance(item, dict):
+            digest.update(b"dict:")
+            for key in sorted(item, key=lambda key: (type(key).__name__, repr(key))):
+                visit(key)
+                visit(item[key])
+        elif isinstance(item, (tuple, list)):
+            digest.update(f"{type(item).__name__}:{len(item)}:".encode())
+            for child in item:
+                visit(child)
+        elif isinstance(item, io.BytesIO):
+            digest.update(b"bytesio:" + item.getvalue())
+        else:
+            digest.update(f"{type(item).__name__}:{item!r}:".encode())
+
+    visit(value)
+    return digest.hexdigest()
+
+
+def _finite(tensor):
+    import torch
+
+    valid = torch.ones((), device=tensor.device, dtype=torch.bool)
+    for chunk in _tensor_chunks(tensor):
+        valid.logical_and_(torch.isfinite(chunk).all())
+    return bool(valid)
+
+
+def _squared_norm(tensor):
+    import torch
+
+    total = torch.zeros((), device=tensor.device, dtype=torch.float32)
+    for chunk in _tensor_chunks(tensor):
+        total.add_(chunk.float().square().sum())
+    return total
+
+
+def _assert_replicated(named_tensors, label):
+    """Compare every element to rank0, with bounded GPU scratch and no sampling."""
+    import torch
+    import torch.distributed as dist
+
+    tensors = list(named_tensors)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if world_size == 1:
+        return {"status": "single_rank", "tensors": len(tensors), "elements": 0}
+    if not tensors:
+        raise ValueError(f"DP {label} check requires at least one tensor")
+    metadata = [(name, tuple(tensor.shape), str(tensor.dtype)) for name, tensor in tensors]
+    identities = [None] * world_size
+    dist.all_gather_object(identities, _state_fingerprint(metadata))
+    if len(set(identities)) != 1:
+        raise AssertionError(f"DP {label} tensor metadata differs between ranks")
+    mismatch = torch.zeros((), device=tensors[0][1].device, dtype=torch.int32)
+    elements = 0
+    for _, tensor in tensors:
+        for chunk in _tensor_chunks(tensor):
+            reference = chunk.clone()
+            dist.broadcast(reference, src=0)
+            mismatch.bitwise_or_((chunk != reference).any().int())
+            elements += chunk.numel()
+    dist.all_reduce(mismatch, op=dist.ReduceOp.MAX)
+    if int(mismatch):
+        raise AssertionError(f"DP {label} differs after synchronization/update")
+    return {"status": "exact", "tensors": len(tensors), "elements": elements}
+
+
+def _memory_summary():
+    import torch
+
+    torch.cuda.synchronize()
+    return {
+        "allocated_bytes": torch.cuda.memory_allocated(),
+        "reserved_bytes": torch.cuda.memory_reserved(),
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+    }
 
 
 def _gradient_summary(model):
@@ -121,13 +309,13 @@ def _gradient_summary(model):
         if not hasattr(param, "main_grad"):
             raise AssertionError(f"Megatron DDP did not allocate main_grad for {name}")
         grad = param.main_grad
-        if not torch.isfinite(grad).all():
+        if not _finite(grad):
             raise AssertionError(f"Non-finite main_grad: {name}")
         if param.grad is not None:
             raise AssertionError(f"DDP gradient hook did not consume param.grad for {name}")
-        grads.append(grad.float().square().sum())
+        grads.append(_squared_norm(grad))
         if ".router." in name and name.endswith("weight"):
-            router_norms[name] = float(grad.float().norm())
+            router_norms[name] = float(_squared_norm(grad).sqrt())
     if not router_norms or any(value <= 0 for value in router_norms.values()):
         raise AssertionError(f"MoE router gradients must be nonzero: {router_norms}")
     return {
@@ -137,8 +325,22 @@ def _gradient_summary(model):
     }
 
 
+def _initialize_adam_state(optimizer, *unused):
+    """MCore calls this before loading sharded optimizer tensors."""
+    import torch
+
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            state = optimizer.state[parameter]
+            if not state:
+                state["step"] = torch.zeros((), dtype=torch.float32, device="cpu")
+                state["exp_avg"] = torch.zeros_like(parameter)
+                state["exp_avg_sq"] = torch.zeros_like(parameter)
+
+
 def _build_training_objects(args, config):
     import torch
+    import torch.distributed as dist
     from megatron.core.distributed import (
         DistributedDataParallel,
         DistributedDataParallelConfig,
@@ -153,29 +355,29 @@ def _build_training_objects(args, config):
     model = GPTModel(
         config=config,
         transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
-        vocab_size=128,
+        vocab_size=args.vocab_size,
         max_sequence_length=args.seq_length,
         parallel_output=True,
         share_embeddings_and_output_weights=False,
         position_embedding_type="rope",
         rotary_base=150000,
     ).cuda()
-    bind_fp4_model(model, rank=0)
+    bind_fp4_model(model, rank=dist.get_rank())
     ddp = DistributedDataParallel(
         config,
         DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
             overlap_grad_reduce=True,
             use_distributed_optimizer=False,
-            bucket_size=100000,
+            bucket_size=40_000_000,
         ),
         model,
     )
     optimizer = Float16OptimizerWithFloat16Params(
-        torch.optim.Adam(model.parameters(), lr=0.002, betas=(0.9, 0.95), weight_decay=0.0),
-        OptimizerConfig(bf16=True, params_dtype=torch.bfloat16, lr=0.002, clip_grad=0.0),
+        torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0, foreach=False),
+        OptimizerConfig(bf16=True, params_dtype=torch.bfloat16, lr=args.lr, clip_grad=0.0),
         grad_scaler=None,
-        init_state_fn=lambda *_: None,
+        init_state_fn=_initialize_adam_state,
     )
     runners = []
     if args.deosc:
@@ -195,6 +397,7 @@ def _build_training_objects(args, config):
                 pipeline_model_parallel_size=1,
                 expert_model_parallel_size=1,
                 context_parallel_size=1,
+                data_parallel_size=dist.get_world_size(),
             ),
         )
         if not runners:
@@ -208,7 +411,7 @@ def _rng_state():
 
     return {
         "torch_cpu": torch.get_rng_state(),
-        "torch_cuda": torch.cuda.get_rng_state_all(),
+        "torch_cuda": torch.cuda.get_rng_state(),
         "megatron_cuda": get_cuda_rng_tracker().get_states(),
     }
 
@@ -218,7 +421,7 @@ def _load_rng_state(state):
     from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 
     torch.set_rng_state(state["torch_cpu"])
-    torch.cuda.set_rng_state_all(state["torch_cuda"])
+    torch.cuda.set_rng_state(state["torch_cuda"])
     get_cuda_rng_tracker().set_states(state["megatron_cuda"])
 
 
@@ -250,43 +453,162 @@ def _assert_equal(left, right, label):
         raise AssertionError(f"Checkpoint replay value differs: {label}")
 
 
-def _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step):
+def _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step, vocab_size):
     import torch
+    import torch.distributed as dist
 
+    torch.cuda.synchronize()
+    started = time.perf_counter()
     optimizer.zero_grad()
     ddp.zero_grad_buffer()
     logits = ddp(input_ids, position_ids, mask)
-    loss = torch.nn.functional.cross_entropy(logits.float().reshape(-1, 128), labels.flatten())
+    loss = torch.nn.functional.cross_entropy(logits.float().reshape(-1, vocab_size), labels.flatten())
     if not torch.isfinite(loss):
         raise AssertionError("Non-finite language model cross entropy")
     loss.backward()
     ddp.finish_grad_sync()
-    row = {"step": step + 1, "loss": float(loss.detach()), **_gradient_summary(model)}
+    average_loss = loss.detach().clone()
+    dist.all_reduce(average_loss)
+    average_loss.div_(dist.get_world_size())
+    row = {
+        "step": step + 1,
+        "loss": float(loss.detach()),
+        "dp_average_loss": float(average_loss),
+        **_gradient_summary(model),
+        "gradient_sync": _assert_replicated(
+            (
+                (name, parameter.main_grad)
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ),
+            "main_grad",
+        ),
+    }
     success, _, _ = optimizer.step()
     if not success:
         raise AssertionError("Optimizer skipped an update")
-    if any(not torch.isfinite(param).all() for param in model.parameters()):
+    if any(not _finite(param) for param in model.parameters()):
         raise AssertionError("Non-finite model parameter after optimizer update")
+    row["parameter_sync"] = _assert_replicated(model.named_parameters(), "model parameters")
+    row["master_sync"] = _assert_replicated(
+        ((str(index), parameter) for index, parameter in enumerate(optimizer.get_parameters())),
+        "FP32 masters",
+    )
+    torch.cuda.synchronize()
+    row["elapsed_seconds_including_checks"] = time.perf_counter() - started
     return row
+
+
+def _save_checkpoint(args, model, optimizer, directory, iteration):
+    import torch
+    import torch.distributed as dist
+
+    if args.checkpoint_format == "torch_dist":
+        from primus.backends.megatron.core.fp4_checkpoint import save_fp4_checkpoint
+
+        save_fp4_checkpoint([model], optimizer, directory, iteration, extra_state={"rng": _rng_state()})
+    else:
+        from primus.backends.megatron.core.fp4_state import save_fp4_sidecar
+
+        torch.save(
+            {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "rng": _rng_state()},
+            directory / f"model_optimizer_rng.rank{dist.get_rank()}.pt",
+        )
+        save_fp4_sidecar(model, optimizer, directory, iteration)
+    dist.barrier()
+
+
+def _load_checkpoint(args, model, optimizer, directory, iteration):
+    import torch
+    import torch.distributed as dist
+
+    if args.checkpoint_format == "torch_dist":
+        from primus.backends.megatron.core.fp4_checkpoint import load_fp4_checkpoint
+
+        extra = load_fp4_checkpoint([model], optimizer, directory, iteration)
+        _load_rng_state(extra["rng"])
+    else:
+        from primus.backends.megatron.core.fp4_state import load_fp4_sidecar
+
+        # The file is generated by this run. mmap avoids keeping a second full
+        # model and Adam state resident on host during large-geometry restore.
+        checkpoint = torch.load(
+            directory / f"model_optimizer_rng.rank{dist.get_rank()}.pt",
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        load_fp4_sidecar(model, optimizer, directory, iteration)
+        _load_rng_state(checkpoint["rng"])
+        del checkpoint
+    dist.barrier()
+
+
+def _training_fingerprints(model, optimizer, *, include_gradients=True):
+    from primus.backends.megatron.core.fp4_state import fp4_state_dict
+
+    fingerprints = {
+        "model": _state_fingerprint(model.state_dict()),
+        "optimizer_and_fp32_masters": _state_fingerprint(optimizer.state_dict()),
+        "private_rng_and_deosc": _state_fingerprint(fp4_state_dict(model, optimizer)),
+        "global_rng": _state_fingerprint(_rng_state()),
+    }
+    if include_gradients:
+        fingerprints["ddp_main_grad"] = _state_fingerprint(
+            {
+                name: parameter.main_grad
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+        )
+    return fingerprints
+
+
+def _comparable_steps(steps):
+    return [
+        {key: value for key, value in row.items() if key != "elapsed_seconds_including_checks"}
+        for row in steps
+    ]
+
+
+def _changed_parameters(model, initial, identities):
+    changed = []
+    for name, parameter in model.named_parameters():
+        if id(parameter) != identities[name]:
+            raise AssertionError(f"Parameter identity changed: {name}")
+        if _state_fingerprint(parameter) != initial[name]:
+            changed.append(name)
+    if not changed or not any(".experts." in name for name in changed):
+        raise AssertionError("Expected model and expert weights to change")
+    return changed
 
 
 def run(args, result):
     import torch
     import torch.distributed as dist
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise RuntimeError("Expose exactly one available GPU using ROCR_VISIBLE_DEVICES")
-    torch.cuda.set_device(0)
+    if args.deterministic:
+        from megatron.training.determinism import apply_determinism_env
+
+        # Validate/set TE, BLAS and collective determinism before creating GPU
+        # contexts or communicators, just as the real MCore training entry does.
+        apply_determinism_env(os.environ)
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size not in (1, 2):
+        raise RuntimeError("The reference smoke supports one or two replicated DP ranks")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != world_size:
+        raise RuntimeError("Expose exactly one GPU per local torchrun rank using ROCR_VISIBLE_DEVICES")
+    torch.cuda.set_device(local_rank)
+    torch.use_deterministic_algorithms(args.deterministic)
 
     from megatron.core import parallel_state, tensor_parallel
 
     from primus.backends.megatron.core.fp4_autograd import execution_counts
     from primus.backends.megatron.core.fp4_dispatch import resolve_fp4_plan
-    from primus.backends.megatron.core.fp4_state import (
-        fp4_state_dict,
-        load_fp4_sidecar,
-        save_fp4_sidecar,
-    )
     from primus.backends.megatron.patches.turbo.fp4_patches import (
         patch_enums,
         patch_fp4_context,
@@ -297,13 +619,22 @@ def run(args, result):
 
     result["environment"] = {
         "python": platform.python_version(),
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "hip": torch.version.hip,
-        "device": torch.cuda.get_device_name(0),
+        "device": torch.cuda.get_device_name(local_rank),
+        "device_total_memory_bytes": torch.cuda.get_device_properties(local_rank).total_memory,
         "visible_devices": os.environ.get("ROCR_VISIBLE_DEVICES"),
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "nvte_allow_nondeterministic_algo": os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO"),
+        "nccl_algo": os.environ.get("NCCL_ALGO"),
     }
     with tempfile.TemporaryDirectory(prefix="primus-fp4-smoke-") as directory:
-        dist.init_process_group("nccl", init_method=f"file://{directory}/rendezvous", rank=0, world_size=1)
+        init_method = "env://" if world_size > 1 else f"file://{directory}/rendezvous"
+        dist.init_process_group("nccl", init_method=init_method, rank=rank, world_size=world_size)
         try:
             parallel_state.initialize_model_parallel(
                 tensor_model_parallel_size=1,
@@ -318,22 +649,42 @@ def run(args, result):
             install_two_level_fp4_spec_provider()
             config = _make_config(args)
             result["plan"] = resolve_fp4_plan(config).to_dict()
+            torch.cuda.reset_peak_memory_stats()
             model, ddp, optimizer, runners = _build_training_objects(args, config)
             model.train()
-            initial = {name: param.detach().clone() for name, param in model.named_parameters()}
-            parameter_ids = {name: id(param) for name, param in model.named_parameters()}
-            master_parameters = optimizer.get_parameters()
-            if any(param.dtype != torch.float32 for param in master_parameters):
+            result["memory"] = {"initialization": _memory_summary()}
+            result["initial_replica_check"] = _assert_replicated(
+                model.named_parameters(), "initial parameters"
+            )
+            initial = {name: _state_fingerprint(parameter) for name, parameter in model.named_parameters()}
+            parameter_ids = {name: id(parameter) for name, parameter in model.named_parameters()}
+            masters = optimizer.get_parameters()
+            if any(parameter.dtype != torch.float32 for parameter in masters):
                 raise AssertionError("Expected FP32 optimizer master parameters")
             result["optimizer"] = {
                 "wrapper": type(optimizer).__name__,
                 "inner": type(optimizer.optimizer).__name__,
-                "master_parameter_count": len(master_parameters),
+                "master_parameter_count": len(masters),
+                "master_element_count": sum(parameter.numel() for parameter in masters),
                 "ddp": type(ddp).__name__,
                 "overlap_grad_reduce": True,
+                "replicated_full_masters": True,
+                "learning_rate": args.lr,
             }
-            data_rng = torch.Generator(device="cpu").manual_seed(args.seed + 1)
-            input_ids = torch.randint(0, 128, (2, args.seq_length), generator=data_rng).cuda()
+            del masters
+            data_rng = torch.Generator(device="cpu").manual_seed(args.seed + 1 + rank)
+            input_ids = torch.randint(
+                0, args.vocab_size, (args.batch_size, args.seq_length), generator=data_rng
+            ).cuda()
+            data_signatures = [None] * world_size
+            dist.all_gather_object(data_signatures, _state_fingerprint(input_ids))
+            if world_size > 1 and len(set(data_signatures)) != world_size:
+                raise AssertionError("DP smoke requires distinct synthetic inputs on each rank")
+            result["data"] = {
+                "rank_seed": args.seed + 1 + rank,
+                "rank_input_sha256": data_signatures,
+                "distinct_between_ranks": len(set(data_signatures)) == world_size,
+            }
             labels = input_ids.roll(-1, dims=-1)
             position_ids = torch.arange(args.seq_length, device="cuda").expand_as(input_ids)
             mask = torch.triu(
@@ -343,84 +694,135 @@ def run(args, result):
             execution_counts(reset=True)
             result["steps"] = []
             checkpoint_step = args.steps // 2
-            checkpoint_directory = Path(directory) / "checkpoint"
-            checkpoint_directory.mkdir()
+            shared_directory = [
+                (
+                    str(args.checkpoint_dir.resolve())
+                    if args.checkpoint_dir
+                    else str(Path(directory) / "checkpoint")
+                )
+            ]
+            dist.broadcast_object_list(shared_directory, src=0)
+            checkpoint_directory = Path(shared_directory[0])
+            if rank == 0:
+                checkpoint_directory.mkdir(parents=True, exist_ok=True)
+                if any(checkpoint_directory.iterdir()):
+                    raise ValueError(f"Use an empty checkpoint directory: {checkpoint_directory}")
+            dist.barrier()
+            torch.cuda.reset_peak_memory_stats()
             for step in range(args.steps):
                 result["steps"].append(
-                    _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step)
+                    _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step, args.vocab_size)
                 )
                 if step + 1 == checkpoint_step:
-                    torch.save(
-                        {
-                            "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "rng": _rng_state(),
-                        },
-                        checkpoint_directory / "model_optimizer_rng.pt",
+                    result["checkpoint_saved_state_sha256"] = _training_fingerprints(
+                        model, optimizer, include_gradients=False
                     )
-                    save_fp4_sidecar(model, optimizer, checkpoint_directory, checkpoint_step)
+                    _save_checkpoint(args, model, optimizer, checkpoint_directory, checkpoint_step)
+                    after_save = _training_fingerprints(model, optimizer, include_gradients=False)
+                    _assert_equal(result["checkpoint_saved_state_sha256"], after_save, "save_side_effects")
+            result["memory"]["training_and_checkpoint"] = _memory_summary()
             result["execution_counts"] = execution_counts()
             for kind in ("dense", "grouped"):
                 for direction in ("fwd", "dgrad", "wgrad"):
                     key = f"{args.recipe}.{kind}.{direction}"
                     if result["execution_counts"].get(key, 0) <= 0:
                         raise AssertionError(f"Quantized path was not exercised: {key}")
-            changed = []
-            for name, param in model.named_parameters():
-                if id(param) != parameter_ids[name]:
-                    raise AssertionError(f"Parameter identity changed: {name}")
-                if not torch.equal(initial[name], param):
-                    changed.append(name)
-            if not changed or not any(".experts." in name for name in changed):
-                raise AssertionError("Expected model and expert weights to change")
-            result["changed_parameters"] = changed
+            result["changed_parameters"] = _changed_parameters(model, initial, parameter_ids)
             result["deosc"] = [
                 {"step_count": runner.step_count, "stats": dict(runner.stats)} for runner in runners
             ]
             if runners and any(runner.stats.get("periods", 0) < 1 for runner in runners):
                 raise AssertionError("DeOsc smoke did not reach a completed period")
-            final_fp4_state = fp4_state_dict(model, optimizer)
-            final_rng = _rng_state()
-            fresh_model, fresh_ddp, fresh_optimizer, _ = _build_training_objects(args, config)
-            # This is a locally generated bundle. TE may store BytesIO extra_state,
-            # so the full model bundle uses Torch's ordinary trusted-file loader.
-            checkpoint = torch.load(checkpoint_directory / "model_optimizer_rng.pt", weights_only=False)
-            fresh_model.load_state_dict(checkpoint["model"], strict=True)
-            fresh_optimizer.load_state_dict(checkpoint["optimizer"])
-            load_fp4_sidecar(fresh_model, fresh_optimizer, checkpoint_directory, checkpoint_step)
-            _load_rng_state(checkpoint["rng"])
+            expected_fingerprints = _training_fingerprints(model, optimizer)
+            # Do not retain two large models, optimizer masters/moments or DeOsc
+            # histories while testing the original GPT-OSS expert-bank geometry.
+            del model, ddp, optimizer, runners
+            gc.collect()
+            torch.cuda.empty_cache()
+            result["memory"]["after_releasing_original"] = _memory_summary()
+            torch.cuda.reset_peak_memory_stats()
+            fresh_model, fresh_ddp, fresh_optimizer, fresh_runners = _build_training_objects(args, config)
+            _load_checkpoint(args, fresh_model, fresh_optimizer, checkpoint_directory, checkpoint_step)
             fresh_model.train()
+            restored_fingerprints = _training_fingerprints(
+                fresh_model, fresh_optimizer, include_gradients=False
+            )
+            result["checkpoint_restored_state_sha256"] = restored_fingerprints
+            _assert_equal(
+                result["checkpoint_saved_state_sha256"],
+                restored_fingerprints,
+                "immediately_restored_state_sha256",
+            )
+            result["checkpoint_initial_state_exact"] = True
             replay = [
-                _step(fresh_model, fresh_ddp, fresh_optimizer, input_ids, position_ids, mask, labels, step)
+                _step(
+                    fresh_model,
+                    fresh_ddp,
+                    fresh_optimizer,
+                    input_ids,
+                    position_ids,
+                    mask,
+                    labels,
+                    step,
+                    args.vocab_size,
+                )
                 for step in range(checkpoint_step, args.steps)
             ]
-            _assert_equal(result["steps"][checkpoint_step:], replay, "losses_and_gradients")
-            _assert_equal(model.state_dict(), fresh_model.state_dict(), "model")
-            _assert_equal(optimizer.state_dict(), fresh_optimizer.state_dict(), "optimizer_and_masters")
-            _assert_equal(final_fp4_state, fp4_state_dict(fresh_model, fresh_optimizer), "private_fp4_state")
-            _assert_equal(final_rng, _rng_state(), "global_rng")
-            _assert_equal(
-                {name: param.main_grad for name, param in model.named_parameters() if param.requires_grad},
-                {
-                    name: param.main_grad
-                    for name, param in fresh_model.named_parameters()
-                    if param.requires_grad
-                },
-                "ddp_main_grad",
-            )
+            # Preserve evidence before asserting so failed replays can distinguish
+            # missing checkpoint state from nondeterministic forward/backward ops.
+            actual_fingerprints = _training_fingerprints(fresh_model, fresh_optimizer)
+            result["memory"]["fresh_restore_and_replay"] = _memory_summary()
             result["checkpoint_replay"] = {
-                "status": "passed",
+                "status": "checking",
+                "format": args.checkpoint_format,
                 "checkpoint_after_step": checkpoint_step,
                 "replayed_steps": replay,
+                "expected_state_sha256": expected_fingerprints,
+                "state_sha256": actual_fingerprints,
+            }
+            _assert_equal(
+                _comparable_steps(result["steps"][checkpoint_step:]),
+                _comparable_steps(replay),
+                "losses_and_gradients",
+            )
+            _assert_equal(expected_fingerprints, actual_fingerprints, "complete_training_state_sha256")
+            result["checkpoint_replay"] = {
+                "status": "passed",
+                "format": args.checkpoint_format,
+                "checkpoint_after_step": checkpoint_step,
+                "replayed_steps": replay,
+                "comparison": "Exact scalar checks and SHA256 over every tensor byte plus structural metadata; no sampling",
+                "state_sha256": actual_fingerprints,
                 "loss_and_gradients_exact": True,
                 "model_parameters_exact": True,
                 "optimizer_and_fp32_masters_exact": True,
                 "ddp_main_grad_exact": True,
                 "private_rng_and_deosc_exact": True,
                 "global_rng_exact": True,
-                "scope": "Fresh model/DDP/optimizer; Torch bundle plus Primus FP4 sidecar",
+                "scope": "Fresh model/DDP/optimizer; original training objects released before reconstruction",
             }
             result["status"] = "passed"
+            rank_summaries = [None] * world_size
+            dist.all_gather_object(
+                rank_summaries,
+                {
+                    "rank": rank,
+                    "status": "passed",
+                    "losses": [row["loss"] for row in result["steps"]],
+                    "dp_average_losses": [row["dp_average_loss"] for row in result["steps"]],
+                    "peak_allocated_bytes": result["memory"]["training_and_checkpoint"][
+                        "peak_allocated_bytes"
+                    ],
+                    "checkpoint_replay": "passed",
+                    "gradient_sync": result["steps"][-1]["gradient_sync"],
+                    "parameter_sync": result["steps"][-1]["parameter_sync"],
+                    "master_sync": result["steps"][-1]["master_sync"],
+                },
+            )
+            result["rank_results"] = rank_summaries
+            del fresh_model, fresh_ddp, fresh_optimizer, fresh_runners
+            gc.collect()
+            dist.barrier()  # All ranks must finish restore before rank0 deletes temporary files.
         finally:
             parallel_state.destroy_model_parallel()
             dist.destroy_process_group()
@@ -428,31 +830,35 @@ def run(args, result):
 
 def main():
     args = parse_args()
+    rank = int(os.environ.get("RANK", "0"))
+    output = (
+        args.output
+        if rank == 0
+        else args.output.with_name(f"{args.output.stem}.rank{rank}{args.output.suffix}")
+    )
+    geometry = model_geometry(args.model_profile, args.num_layers)
     result = {
         "status": "running",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "recipe": args.recipe,
+        "quantizer": args.quantizer,
         "seed": args.seed,
         "model": {
             "implementation": "Megatron GPTModel",
-            "layers": 2,
-            "layer_pattern": ["dense", "moe"],
-            "hidden_size": 128,
-            "attention_heads": 2,
-            "kv_channels": 64,
-            "num_experts": 4,
-            "topk": 2,
-            "ffn_hidden_size": 128,
-            "batch_size": 2,
+            "profile": args.model_profile,
+            **geometry,
+            "batch_size": args.batch_size,
             "seq_length": args.seq_length,
-            "vocab_size": 128,
+            "vocab_size": args.vocab_size,
             "activation": "SiLU GLU",
             "glu_clamp": args.glu_clamp,
             "glu_offset": args.glu_offset,
             "attention": "TE unfused BF16; no FlyDSL performance comparison",
-            "data": "fixed synthetic tokens; no convergence claim",
+            "data": "fixed synthetic tokens per rank; no convergence claim",
             "activation_recompute": "full/uniform/1" if args.recompute else None,
         },
+        "checkpoint_format": args.checkpoint_format,
+        "source_sha256": _source_fingerprints(),
     }
     try:
         run(args, result)
@@ -461,12 +867,10 @@ def main():
         result["traceback"] = traceback.format_exc()
         raise
     finally:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-        print(f"FP4 smoke {result['status']}: {args.output}", flush=True)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        print(f"FP4 smoke rank{rank} {result['status']}: {output}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
-    # Permit direct invocation from the repository without an editable install.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     main()

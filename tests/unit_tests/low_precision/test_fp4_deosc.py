@@ -164,6 +164,57 @@ def test_checkpoint_rejection_is_strict_and_atomic(corruption):
     assert_state_equal(runner.state_dict(), before)
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_window", "missing_binding", "missing_manifest", "false_presence", "nonboolean", "old_version"],
+)
+def test_checkpoint_rejects_lost_windows_and_invalid_presence_atomically(corruption):
+    model, master, cfg = binding()
+    owner = SimpleNamespace(_primus_fp4_last_config=cfg)
+    runner = D.TwoLevelDeOsc({"weight": (model, master, cfg)}, period=2, active_modules={"weight": owner})
+    runner.step()
+    master.view(-1)[0] = 0.75390625
+    runner.step()
+    saved, before = runner.state_dict(), runner.state_dict()
+    assert saved["window_presence"] == {"weight": True}
+    assert saved["states"]["weight"]["window_steps"] == 1
+    if corruption == "missing_window":
+        del saved["states"]["weight"]
+    elif corruption == "missing_binding":
+        del saved["window_presence"]["weight"]
+    elif corruption == "missing_manifest":
+        del saved["window_presence"]
+    elif corruption == "false_presence":
+        saved["window_presence"]["weight"] = False
+    elif corruption == "nonboolean":
+        saved["window_presence"]["weight"] = 1
+    else:
+        saved["version"] = 1
+    with pytest.raises(ValueError, match="DeOsc checkpoint"):
+        runner.load_state_dict(saved)
+    assert_state_equal(runner.state_dict(), before)
+
+
+def test_checkpoint_roundtrips_explicitly_inactive_bf16_window():
+    model, master, cfg = binding()
+    owner = SimpleNamespace(_primus_fp4_last_config=cfg)
+    runner = D.TwoLevelDeOsc({"weight": (model, master, cfg)}, period=2, active_modules={"weight": owner})
+    runner.step()
+    owner._primus_fp4_last_config = None
+    runner.step()
+    saved = runner.state_dict()
+    assert saved["version"] == 2
+    assert saved["window_presence"] == {"weight": False}
+    assert saved["states"] == {}
+    restored = D.TwoLevelDeOsc({"weight": (model, master, cfg)}, period=2, active_modules={"weight": owner})
+    restored.load_state_dict(saved)
+    assert_state_equal(restored.state_dict(), saved)
+    owner._primus_fp4_last_config = cfg
+    restored.step()
+    assert restored.state_dict()["window_presence"] == {"weight": True}
+    assert restored.state_dict()["states"]["weight"]["window_steps"] == 0
+
+
 class ReferenceModule(torch.nn.Module):
     def __init__(self, recipe="nvfp4", stream="rank0/model0/layer0"):
         super().__init__()
@@ -280,6 +331,7 @@ def test_installer_rejects_unsupported_contracts_before_mutating_optimizer(chang
         optimizer.float16_groups, optimizer.fp32_from_float16_groups = [[]], [[]]
     elif change == "dp2":
         options.data_parallel_size = 2
+        options.use_distributed_optimizer = True
     elif change == "precision_aware":
         optimizer.config.use_precision_aware_optimizer = True
     elif change == "reuse":
@@ -293,3 +345,15 @@ def test_installer_rejects_unsupported_contracts_before_mutating_optimizer(chang
         D.install_megatron_deosc(optimizer, [model], options)
     assert optimizer.step_with_ready_grads == original_step
     assert not hasattr(optimizer, "_primus_two_level_deosc")
+
+
+def test_replicated_dp2_full_masters_are_supported():
+    model = ReferenceModule()
+    optimizer = MockFloat16Optimizer(model)
+    options = args()
+    options.data_parallel_size = 2
+    options.use_distributed_optimizer = False
+    runners = D.install_megatron_deosc(optimizer, [model], options)
+    assert len(runners) == 1
+    optimizer.step_with_ready_grads()
+    assert runners[0].step_count == 1

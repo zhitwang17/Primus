@@ -4,6 +4,7 @@
 import copy
 import importlib
 import importlib.util
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,6 +73,20 @@ def test_binding_is_stable_private_and_idempotent():
     assert model[0].fp4_rng.sr_offset == 9
     with pytest.raises(ValueError, match="moved"):
         S.bind_fp4_model(model, rank=4)
+
+
+def test_quantizer_selection_preserves_rng_numbers_but_has_distinct_checkpoint_identity():
+    torch_model, triton_model = Layer(), Layer()
+    triton_model.fp4_config = replace(triton_model.fp4_config, quantizer="triton")
+    triton_model.fp4_configs = (triton_model.fp4_config,)
+    S.bind_fp4_model(torch_model)
+    S.bind_fp4_model(triton_model)
+    assert torch_model.fp4_config.fingerprint != triton_model.fp4_config.fingerprint
+    assert torch_model.fp4_config.rng_fingerprint == triton_model.fp4_config.rng_fingerprint
+    for stream in ("sr", "rht"):
+        assert torch_model.fp4_rng.reserve(stream, 64) == triton_model.fp4_rng.reserve(stream, 64)
+    with pytest.raises(ValueError, match="recipes"):
+        S.load_fp4_state_dict(triton_model, S.fp4_state_dict(torch_model))
 
 
 @pytest.mark.parametrize("field", ["version", "backend", "rng_implementation", "torch_version", "topology"])

@@ -53,12 +53,15 @@ class TwoLevelFP4Config:
     rht_randomized: bool = True
     gradient_sr: bool = True
     rng_seed: int = 1234
+    quantizer: str = "torch"
     version: int = 1
 
     def __post_init__(self):
         object.__setattr__(self, "recipe", _name(self.recipe))
         if self.recipe not in ("nvfp4", "amdfp4"):
             raise ValueError("TwoLevelFP4Config requires nvfp4 or amdfp4")
+        if self.quantizer not in ("torch", "triton"):
+            raise ValueError("Two-level FP4 quantizer must be torch or triton")
         for key in ("weight_2d", "rht_randomized", "gradient_sr"):
             object.__setattr__(self, key, _boolean(getattr(self, key), key))
         if self.block_size != 16 or isinstance(self.block_size, bool):
@@ -91,6 +94,13 @@ class TwoLevelFP4Config:
     @property
     def fingerprint(self):
         return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True).encode()).hexdigest()
+
+    @property
+    def rng_fingerprint(self):
+        """Kernel selection must not perturb a recipe's stochastic sequence."""
+        numerical = self.to_dict()
+        numerical.pop("quantizer")
+        return hashlib.sha256(json.dumps(numerical, sort_keys=True).encode()).hexdigest()
 
     def operand(self, direction, role):
         axes = {

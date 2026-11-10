@@ -16,8 +16,9 @@ from collections import Counter
 import torch
 import torch.nn.functional as F
 
+from .fp4_backend import compute_outer_scale, qdq
 from .fp4_contract import FP4RandomState, padded_group_offsets
-from .fp4_reference import compute_outer_scale, qdq, rht_pair
+from .fp4_reference import rht_pair
 
 _EXECUTIONS = Counter()
 

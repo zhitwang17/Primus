@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""DP1 full-parameter DeOsc for the NVFP4/AMDFP4 reference adapters.
+"""Full-parameter DeOsc for the NVFP4/AMDFP4 reference adapters.
 
 The detector retains Primus' BF16 snapshot/delta policy and FP32 distance
 accumulators. Its QDQ is the *forward* two-level weight QDQ, including BF16
@@ -12,7 +12,8 @@ Call ``step`` after a successful optimizer update and before master-to-model
 copy. At a period boundary the master is snapped to current BF16 QDQ centers;
 then QDQ is recomputed over the entire weight because its dynamic scale may
 change. A checkpoint records the numerical recipe and snapshot policy as well
-as each observation window. Partial optimizer shards are deliberately refused.
+as each observation window. Replicated DP masters are supported; partial
+optimizer shards are deliberately refused.
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ from typing import Mapping
 
 import torch
 
+from ..fp4_backend import qdq
 from ..fp4_contract import TwoLevelFP4Config
-from ..fp4_reference import qdq
 
 _ALGORITHM = "two-level-fp4-dist-ratio-v1"
 _SNAPSHOT_POLICY = "bf16-snapshots-bf16-deltas-fp32-accumulators"
@@ -91,7 +92,7 @@ class TwoLevelDeOsc:
 
     def _identity(self):
         return {
-            "version": 1,
+            "version": 2,
             "algorithm": _ALGORITHM,
             "snapshot_policy": _SNAPSHOT_POLICY,
             "rng_policy": _RNG_POLICY,
@@ -176,6 +177,10 @@ class TwoLevelDeOsc:
             **self._identity(),
             "step_count": self.step_count,
             "stats": dict(self._stats),
+            # Every binding is explicit, including inactive BF16 overrides.
+            # Otherwise a missing window is indistinguishable from inactivity
+            # and resume can silently re-seed a partially observed period.
+            "window_presence": {key: key in self._states for key in self.bindings},
             "states": {
                 key: {
                     name: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
@@ -188,7 +193,12 @@ class TwoLevelDeOsc:
     def validate_state_dict(self, saved):
         """Validate the entire state without modifying the runner or tensors."""
         identity = self._identity()
-        if not isinstance(saved, dict) or set(saved) != set(identity) | {"step_count", "stats", "states"}:
+        if not isinstance(saved, dict) or set(saved) != set(identity) | {
+            "step_count",
+            "stats",
+            "window_presence",
+            "states",
+        }:
             raise ValueError("DeOsc checkpoint fields mismatch")
         if any(saved[name] != value for name, value in identity.items()):
             raise ValueError("DeOsc checkpoint recipe/shape/settings/snapshot identity mismatch")
@@ -200,8 +210,17 @@ class TwoLevelDeOsc:
             or any(type(value) is not int or value < 0 for value in saved["stats"].values())
         ):
             raise ValueError("Invalid DeOsc checkpoint statistics")
+        presence = saved["window_presence"]
+        if (
+            not isinstance(presence, dict)
+            or set(presence) != set(self.bindings)
+            or any(type(value) is not bool for value in presence.values())
+        ):
+            raise ValueError("Invalid DeOsc checkpoint window presence manifest")
         states = saved["states"]
-        if not isinstance(states, dict) or not set(states).issubset(self.bindings):
+        if not isinstance(states, dict) or set(states) != {
+            key for key, present in presence.items() if present
+        }:
             raise ValueError("Invalid DeOsc checkpoint parameter windows")
         if saved["step_count"] == 0 and states:
             raise ValueError("Unstarted DeOsc checkpoint cannot contain observation windows")
@@ -350,7 +369,6 @@ def install_megatron_deosc(optimizer, models, args):
     if hasattr(optimizer, "_primus_two_level_deosc_runners"):
         raise ValueError("Two-level FP4 DeOsc is already installed")
     for name in (
-        "data_parallel_size",
         "tensor_model_parallel_size",
         "pipeline_model_parallel_size",
         "expert_model_parallel_size",
@@ -359,8 +377,15 @@ def install_megatron_deosc(optimizer, models, args):
     ):
         if _get(args, name, 1) not in (None, 1):
             raise ValueError(f"Two-level FP4 DeOsc currently requires {name}=1")
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
-        raise ValueError("Two-level FP4 DeOsc currently requires a single process / DP1")
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    dp_size = max(world_size, _get(args, "data_parallel_size", 1) or 1)
+    if dp_size > 1:
+        if _get(args, "use_distributed_optimizer", False) or any(
+            hasattr(opt, "model_float16_groups") for opt in _leaf_optimizers(optimizer)
+        ):
+            raise ValueError(
+                "FP4 DeOsc with DP>1 requires replicated full FP32 masters, not optimizer shards"
+            )
     for name in (
         "weight_deosc_fusion",
         "weight_deosc_direct_qdq",
