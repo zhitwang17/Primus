@@ -229,6 +229,14 @@ def build_recipe(
         },
         "comparison_boundary": "Matched seed, data-index horizon, effective batch, LR schedule and evaluation steps; recipe comparison, not isolated format attribution",
         "deosc_boundary_difference": "Existing MXFP4 detector may approximate boundary shards; two-level detector uses exact global outer and boundary tile reconstruction",
+        "deosc_settings": {
+            "enabled": overrides["weight_deosc"],
+            "start_step": overrides["weight_deosc_start_step"],
+            "period": overrides["weight_deosc_period"],
+            "ratio": overrides["weight_deosc_ratio"],
+            "accumulator_dtype": overrides["weight_deosc_accumulator_dtype"],
+            "epsilon": overrides["weight_deosc_epsilon"],
+        },
         "checkpoint_policy": "Full-model checkpoints disabled for bounded runs; separate real-MCore smoke validates checkpoint continuation",
         "early_stop_policy": {
             "target_eval_loss": float(environment["MLLOG_TARGET_EVAL_LOSS"]),

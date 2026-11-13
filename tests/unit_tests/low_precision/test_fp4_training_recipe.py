@@ -66,6 +66,14 @@ def test_full_model_real_data_uses_default_shell_schedule_and_bounded_exit(recip
     assert args["disable_last_saving"] is True and args["auto_continue_train"] is False
     assert args["recompute_granularity"] == "full" and args["recompute_num_layers"] == 1
     assert "approximate boundary shards" in manifest["deosc_boundary_difference"]
+    assert manifest["deosc_settings"] == {
+        "enabled": True,
+        "start_step": 768,
+        "period": 100,
+        "ratio": args["weight_deosc_ratio"],
+        "accumulator_dtype": "fp32",
+        "epsilon": 1e-12,
+    }
 
 
 def test_all_arms_share_data_seed_schedule_attention_and_optimizer_contract():
@@ -190,6 +198,10 @@ def test_admission_changes_detector_window_and_eval_without_shortening_data_hori
         assert admission[key] == standard[key]
     assert admission["exit_interval"] == 8 and admission["weight_deosc_start_step"] == 0
     assert admission["weight_deosc_period"] == 2
+    assert manifest["deosc_settings"]["enabled"] is True
+    assert manifest["deosc_settings"]["start_step"] == 0
+    assert manifest["deosc_settings"]["period"] == 2
+    assert manifest["deosc_settings"]["ratio"] == standard["weight_deosc_ratio"]
     assert admission["eval_iters"] == 1 and manifest["validation_steps"] == [4, 8]
     assert admission["recompute_granularity"] == "full"
     assert admission["recompute_method"] == "uniform" and admission["recompute_num_layers"] == 1
