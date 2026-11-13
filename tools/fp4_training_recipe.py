@@ -84,6 +84,7 @@ def build_recipe(
     admission=False,
     supplemental_dp4=False,
     supplemental_dp4_prefix=False,
+    dp4_3000=False,
     sr_rng="torch_cpu",
     value_checks="strict",
     comparison_rmsnorm_backend="native",
@@ -98,6 +99,10 @@ def build_recipe(
         )
     if comparison_rmsnorm_backend not in ("native", "torch"):
         raise ValueError("comparison_rmsnorm_backend must be native or torch")
+    if dp4_3000 and (
+        supplemental_dp4 or supplemental_dp4_prefix or admission or steps != 3000 or not recompute
+    ):
+        raise ValueError("DP4 3000 requires exactly 3000 updates, full recompute, and no diagnostic scope")
     if sr_rng not in ("torch_cpu", "triton_philox"):
         raise ValueError("Expected sr_rng=torch_cpu or triton_philox")
     if value_checks not in ("strict", "grouped_deferred"):
@@ -155,7 +160,7 @@ def build_recipe(
         # pending and the existing MX DeOsc warmup path is outside that wrapper.
         SYNTH_WARMUP_STEPS="0",
     )
-    if supplemental_dp4 or supplemental_dp4_prefix:
+    if supplemental_dp4 or supplemental_dp4_prefix or dp4_3000:
         environment.update(GPUS_PER_NODE="4", DGXSYSTEM="MI355X_1x4x1")
     original = expand(yaml.safe_load(base.read_text()), environment)
     result = copy.deepcopy(original)
@@ -281,7 +286,7 @@ def build_recipe(
         },
         "environment": environment,
     }
-    if supplemental_dp4 or supplemental_dp4_prefix:
+    if supplemental_dp4 or supplemental_dp4_prefix or dp4_3000:
         geometry = dict(
             num_layers=24,
             hidden_size=2880,
@@ -327,6 +332,28 @@ def build_recipe(
         manifest["rmsnorm_control"] = (
             "torch FP32 arithmetic in both combined QKV RMSNorm slots; parameter dtype and zero-centered addition preserved"
         )
+    if dp4_3000:
+        required = {
+            "weight_deosc_start_step": 768,
+            "weight_deosc_period": 100,
+            "weight_deosc_accumulator_dtype": "fp32",
+            "weight_deosc_epsilon": 1e-12,
+            "eval_interval": 384,
+            "eval_iters": 32,
+            "lr_decay_iters": 1199883,
+            "lr_warmup_iters": 117,
+            "lr": 5.7e-4,
+            "min_lr": 5.7e-5,
+        }
+        if any(overrides.get(key) != value for key, value in required.items()):
+            raise ValueError("DP4 3000 must preserve the default schedule and DeOsc settings")
+        manifest.update(
+            scope="dp4_3000_comparison",
+            evaluation_interval=384,
+            evaluation_iters=32,
+            default_dp8_3000_comparison=False,
+            comparison_boundary="Full-model DP4 3000-update recipe comparison with GBS32/GAS2; not DP8. Early convergence is separate from completion of 3000 updates. Last scheduled validation is update 2688; one seed does not establish a convergence advantage.",
+        )
     return result, manifest
 
 
@@ -344,6 +371,7 @@ def main():
     supplemental = parser.add_mutually_exclusive_group()
     supplemental.add_argument("--supplemental-dp4", action="store_true")
     supplemental.add_argument("--supplemental-dp4-prefix", action="store_true")
+    supplemental.add_argument("--dp4-3000", action="store_true")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
@@ -359,6 +387,7 @@ def main():
         admission=args.admission,
         supplemental_dp4=args.supplemental_dp4,
         supplemental_dp4_prefix=args.supplemental_dp4_prefix,
+        dp4_3000=args.dp4_3000,
         sr_rng=args.sr_rng,
         value_checks=args.value_checks,
         comparison_rmsnorm_backend=args.comparison_rmsnorm_backend,

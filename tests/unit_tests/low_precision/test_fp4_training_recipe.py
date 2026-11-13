@@ -314,3 +314,42 @@ def test_cli_artifacts_replay_exact_rendered_recipe_and_provenance(tmp_path):
     assert args["fp4_value_checks"] == manifest["fp4_value_checks"] == "grouped_deferred"
     assert manifest["changed_overrides"]["exit_interval"]["after"] == args["exit_interval"]
     assert manifest["changed_overrides"]["weight_deosc_fusion"] == {"before": True, "after": False}
+
+
+@pytest.mark.parametrize("recipe", ["mxfp4", "nvfp4", "amdfp4"])
+@pytest.mark.parametrize("norm_backend", ["native", "torch"])
+def test_dp4_3000_keeps_full_workload_and_schedule(recipe, norm_backend):
+    _, args, manifest = _build(recipe, dp4_3000=True, sr_rng="triton_philox", value_checks="grouped_deferred", comparison_rmsnorm_backend=norm_backend)
+    assert args.get("fp4_comparison_rmsnorm_backend", "native") == norm_backend
+    assert ("rmsnorm_control" in manifest) == (norm_backend == "torch")
+    assert manifest["scope"] == "dp4_3000_comparison"
+    assert manifest["expected_world_size"] == 4
+    assert manifest["gradient_accumulation_steps"] == 2
+    assert args["global_batch_size"] == 4 * args["micro_batch_size"] * 2 == 32
+    assert args["exit_interval"] == manifest["optimizer_update_limit"] == 3000
+    assert args["train_iters"] == 1200000 and args["lr_decay_iters"] == 1199883
+    assert args["weight_deosc_start_step"] == 768 and args["weight_deosc_period"] == 100
+    assert args["eval_interval"] == 384 and args["eval_iters"] == 32
+    assert manifest["validation_steps"] == [384, 768, 1152, 1536, 1920, 2304, 2688]
+    assert manifest["default_dp8_3000_comparison"] is False
+    assert "deosc_activated_in_prefix" not in manifest
+    assert manifest["environment"]["GPUS_PER_NODE"] == "4"
+    assert manifest["early_stop_policy"]["target_reached_status"] == "converged"
+    assert manifest["full_geometry"]["num_layers"] == 24
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"steps": 128},
+        {"steps": 2999},
+        {"steps": 3001},
+        {"admission": True},
+        {"supplemental_dp4": True, "admission": True, "steps": 8},
+        {"supplemental_dp4_prefix": True, "steps": 128},
+        {"recompute": False},
+    ],
+)
+def test_dp4_3000_does_not_alias_a_short_or_diagnostic_run(kwargs):
+    with pytest.raises(ValueError):
+        _build("nvfp4", dp4_3000=True, **kwargs)
