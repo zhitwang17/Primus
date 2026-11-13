@@ -133,6 +133,11 @@ weight_deosc_period: 200
 weight_deosc_ratio: 4.0
 # global optimizer step at which de-oscillation tracking starts
 weight_deosc_start_step: 0
+# Two-level FP4 detector policy. fp32 matches the existing MXFP4 detector;
+# bf16 selects ALTO-style rounded distance accumulation. Null epsilon selects
+# 1e-12 for fp32 or 1e-30 for bf16. Both are strict checkpoint identity fields.
+weight_deosc_accumulator_dtype: fp32
+weight_deosc_epsilon: null
 # log a summary every N periods (0 disables logging)
 weight_deosc_log_freq: 0
 # use Primus-Turbo fused distance-update and period-closure kernels

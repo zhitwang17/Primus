@@ -317,7 +317,17 @@ def test_grouped_2d_bias_is_not_a_quantized_weight_binding():
 
 @pytest.mark.parametrize(
     "change",
-    ["partial", "master_bf16", "missing", "dp2", "precision_aware", "reuse", "unbound", "fusion"],
+    [
+        "partial",
+        "master_bf16",
+        "missing",
+        "dp2",
+        "dp2_missing_metadata",
+        "hidden_precision_aware",
+        "reuse",
+        "unbound",
+        "fusion",
+    ],
 )
 def test_installer_rejects_unsupported_contracts_before_mutating_optimizer(change):
     model = ReferenceModule()
@@ -329,11 +339,13 @@ def test_installer_rejects_unsupported_contracts_before_mutating_optimizer(chang
         optimizer.fp32_from_float16_groups = [[optimizer.master.bfloat16()]]
     elif change == "missing":
         optimizer.float16_groups, optimizer.fp32_from_float16_groups = [[]], [[]]
-    elif change == "dp2":
+    elif change in ("dp2", "dp2_missing_metadata"):
+        if change == "dp2_missing_metadata":
+            optimizer = MockFloat16Optimizer(model, distributed=True)
         options.data_parallel_size = 2
         options.use_distributed_optimizer = True
-    elif change == "precision_aware":
-        optimizer.config.use_precision_aware_optimizer = True
+    elif change == "hidden_precision_aware":
+        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = True
     elif change == "reuse":
         optimizer.config.reuse_grad_buf_for_mxfp8_param_ag = True
     elif change == "unbound":
@@ -357,3 +369,20 @@ def test_replicated_dp2_full_masters_are_supported():
     assert len(runners) == 1
     optimizer.step_with_ready_grads()
     assert runners[0].step_count == 1
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_precision_aware_flag_with_explicit_fp32_masters_is_supported(distributed):
+    model = ReferenceModule()
+    model._primus_fp4_last_config = model.fp4_config
+    optimizer = MockFloat16Optimizer(model, distributed=distributed)
+    optimizer.config.use_precision_aware_optimizer = True
+    optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = False
+    options = args(use_precision_aware_optimizer=True)
+    runner = D.install_megatron_deosc(optimizer, [model], options)[0]
+    optimizer.step_with_ready_grads()
+    assert runner.step_count == 1
+    optimizer.master.flatten()[0] = 0.75390625
+    optimizer.step_with_ready_grads()
+    assert runner.stats["snapped"] == 1
+    assert model.weight.flatten()[0].item() == 1.0

@@ -21,7 +21,8 @@ milestone; its missing-consumer limitation is superseded by this implementation.
 | Megatron adapters | `core/extensions/two_level_fp4.py`: dense, norm+linear, grouped linears and MoE MLP; standard Parameters, bias/probs/GLU gradients and DDP hooks |
 | Dispatch | `patches/two_level_fp4_patches.py`: install the reference spec provider after the general Primus provider; Turbo modules reject new-format metadata |
 | Private state | `core/fp4_state.py`: stable rank/module/recipe RNG identity, strict continuation metadata and atomic per-rank sidecars |
-| DeOsc | `core/optimizer/two_level_fp4_deosc.py`: successful update, full FP32 master QDQ and observation before master-to-model copy |
+| DeOsc | `core/optimizer/two_level_fp4_deosc.py`: successful-update observation before master-to-model copy; explicit distance precision |
+| Optimizer-sharded DeOsc | `core/optimizer/two_level_fp4_deosc_shard.py`: exact whole-bank outer and boundary-block QDQ with rank-local masters/history |
 | Training hooks | `patches/two_level_fp4_state_patches.py`: bind after model creation, install DeOsc, save/restore state around standard Primus checkpoint calls |
 | Native checkpoint harness | `core/fp4_checkpoint.py`: real Megatron `torch_dist` model/optimizer tensors plus rank-local RNG and strict FP4 sidecars |
 
@@ -54,8 +55,12 @@ continuation requires the same Torch version. Value checks and routed lengths
 may synchronize the GPU: this backend favors inspectable correctness.
 
 DeOsc uses the same BF16 pre-rounding and whole-bank forward grid as the GEMM.
-It retains Primus's BF16 snapshot/subtraction policy, FP32 distance sums and FP32
-master snap. After a snap it recomputes the entire grid because dynamic outer
+It defaults to Primus's BF16 snapshot/subtraction policy, FP32 distance sums,
+epsilon `1e-12`, and FP32 master snap. `weight_deosc_accumulator_dtype: bf16`
+selects BF16 distance sums and defaults epsilon to `1e-30`, matching
+[ALTO's distance update and allocation policy](https://github.com/AMD-AGI/ALTO/blob/b802605deaddecee17fc5580405124b6295ca613/alto/components/optimizer.py#L290).
+`weight_deosc_epsilon` can override the precision-dependent default; precision
+and epsilon are explicit checkpoint identity fields. After a snap it recomputes the entire grid because dynamic outer
 scales can change. BF16 override modules are skipped, unsuccessful optimizer
 steps and reload copies do not advance windows, and bias/norm parameters are
 excluded. Legacy MXFP4 fused/direct-QDQ code is never used for these recipes.
@@ -69,12 +74,15 @@ reference provider is selected automatically for these recipes/backend.
 `use_turbo_gemm` and `use_turbo_grouped_gemm` are unnecessary and default to false
 in the fragments. Existing Turbo attention can still be selected separately.
 
-Initial execution scope is TP1/EP1/PP1/CP1, grouped MoE, BF16 model weights.
-DeOsc requires complete explicit FP32 masters. Ordinary Megatron Float16Optimizer
-supports replicated DP masters; full DP1 DistributedOptimizer mappings are also
-implemented. GPU smoke covers the former. DP>1 DistributedOptimizer and partial master shards, TE op
-fusers, CUDA graphs, offload, native FP4 parameters and MXFP4 producer/fusion
-paths are rejected or remain outside this supported reference path.
+Execution scope is TP1/EP1/PP1/CP1, grouped MoE, BF16 model weights.
+DeOsc supports explicit FP32 masters in replicated Float16Optimizer and mapped
+DistributedOptimizer shards. The 2026-11-10 GPU evidence below covers replicated
+masters. The 2026-11-13 sharded implementation has CPU/Gloo validation; GPU
+DistributedOptimizer qualification remains pending. Precision-aware Adam moments
+are permitted when MCore still owns explicit FP32 masters. The hidden-master
+`use_precision_aware_optimizer_no_fp8_or_ds_fp8` path is rejected. TE op fusers,
+CUDA graphs, offload, native FP4 parameters and MXFP4 producer/fusion paths remain
+outside this supported reference path.
 
 Continuation records each module's names, parameter shape/dtype/trainability,
 base/train/eval routing and override flags, recipe fingerprints, SR/RHT offsets,
@@ -85,14 +93,54 @@ so Torch/Triton comparisons do not change the random sequence. The complete
 checkpoint identity still includes that choice and rejects implementation
 switches on resume. Older checkpoints without the new quantizer identity also
 fail strict continuation; no implicit migration is performed.
-DeOsc schema v2 records a complete window-presence manifest, so a missing
-active window is rejected instead of silently reseeded. The prior v1 schema
-is rejected explicitly.
+Replicated DeOsc schema v2 records a complete window-presence manifest, so a
+missing active window is rejected instead of silently reseeded. Sharded schema
+v3 additionally pins process-group membership and each logical parameter's flat
+partitions. Restore requires the same topology and partition layout; elastic
+resharding is not implemented. Missing precision/epsilon identity fields and
+the prior v1 schema are rejected explicitly.
 
 Sidecars are written before the ordinary checkpoint tracker can advance.
 Nonpersistent checkpoints are unsupported. Grouped reference weights use the
 `weights[E,N,K]` schema; importing existing TE `weight{i}` checkpoints needs an
 explicit converter and is not implemented by this change.
+
+## Optimizer-sharded DeOsc
+
+The installer reads complete parameter membership from each MCore DDP buffer's
+`param_index_map`, and local master coordinates from
+`_get_model_param_range_map(parameter)["param"]`. Bucket offsets and padding are
+not logical weight coordinates. Non-owner ranks keep empty bindings and still
+participate in the same collectives. DeOsc keys omit the RNG stream's rank
+prefix; the private SR/RHT stream retains it unchanged.
+
+Each update reduces BF16-rounded master maxima across the optimizer's actual DP
+group, preserving one outer scalar for the complete `[E,N,K]` expert bank.
+Only tile-row stripes crossed by partition boundaries are exchanged. Locally
+complete interiors use the existing quantizer directly; crossing stripes are
+reconstructed exactly, including non-aligned dimensions and expert boundaries.
+There is no full-parameter master all-gather or boundary zero-fill approximation.
+After snapping, all ranks recompute the scales from the updated masters.
+
+Persistent `prev`, `prev_q`, `dist_w` and `dist_q` contain only locally owned
+elements: 12 bytes per tracked element with FP32 distances, or 8 with BF16
+distances, excluding master weights and temporary QDQ buffers. Rank-local
+sidecars preserve these slices. The step hook runs once after an optimizer
+update and before master-to-model copy/all-gather; microbatch accumulation,
+skipped updates and constructor/load copies do not advance its windows.
+Collective checks reject invalid ownership, inconsistent active routing and
+divergent window progress before entering parameter QDQ collectives.
+
+CPU/Gloo tests compare all local master/history slices with the full-parameter
+reference after every update, snap and fresh-object restore. They cover both
+formats, 1-D/2-D weight blocks, BF16/FP32 distances, crossed blocks/experts,
+non-aligned shapes and empty owners. These tests do not qualify GPU performance,
+the full model, data-loader continuation or convergence.
+
+The existing MXFP4 DeOsc implementation uses FP32 distances but approximates
+cross-shard boundary blocks with zero-fill. Its boundary policy differs from
+this exact two-level path. A first comparison with that baseline is a comparison
+of deployable recipes; its outcome cannot be attributed solely to FP4 format.
 
 ## Validation and reproduction
 
@@ -216,5 +264,5 @@ must retain the BF16 materialization boundary unless changing the recipe.
 
 For a custom full MLPerf experiment, the launcher still requires explicit
 `PRIMUS_LINEAR_PRECISION=nvfp4|amdfp4`. Native FP4 performance kernels,
-optimizer sharding, imported baseline checkpoints, full convergence and
-MLPerf/TTT comparisons remain subsequent work.
+GPU qualification of optimizer sharding, imported baseline checkpoints, full
+convergence and MLPerf/TTT comparisons remain subsequent work.

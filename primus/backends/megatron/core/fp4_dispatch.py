@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -141,14 +142,29 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
         ):
             raise ValueError("FP4 reference MoE requires moe_grouped_gemm=true")
         if _boolean(option(config, "weight_deosc", False, fallback), "weight_deosc"):
-            for name in ("data_parallel_size", "world_size"):
-                if option(config, name, 1, fallback) != 1 and _boolean(
-                    option(config, "use_distributed_optimizer", False, fallback), "use_distributed_optimizer"
-                ):
-                    raise ValueError("FP4 DeOsc with DP>1 requires replicated full FP32 masters")
-            for name in ("use_precision_aware_optimizer", "reuse_grad_buf_for_mxfp4_param_ag"):
+            # DistributedOptimizer's ordinary FP32 master shards are supported.
+            # The installer validates their actual parameter ranges and DP group;
+            # hidden masters, offload and foreign parameter-storage contracts are not.
+            for name in (
+                "use_precision_aware_optimizer_no_fp8_or_ds_fp8",
+                "optimizer_cpu_offload",
+                "reuse_grad_buf_for_mxfp4_param_ag",
+                "reuse_grad_buf_for_mxfp8_param_ag",
+                "use_megatron_fsdp",
+            ):
                 if _boolean(option(config, name, False, fallback), name):
                     raise ValueError(f"Reference FP4 DeOsc does not support {name}")
+            accumulator = option(config, "weight_deosc_accumulator_dtype", "fp32", fallback)
+            if accumulator not in ("fp32", "bf16"):
+                raise ValueError("weight_deosc_accumulator_dtype must be fp32 or bf16")
+            epsilon = option(config, "weight_deosc_epsilon", None, fallback)
+            if epsilon is not None and (
+                isinstance(epsilon, bool)
+                or not isinstance(epsilon, (int, float))
+                or not math.isfinite(epsilon)
+                or epsilon <= 0
+            ):
+                raise ValueError("weight_deosc_epsilon must be finite and positive")
     # These producers/optimizer hooks embed MXFP4 assumptions even when the
     # GEMM itself is delegated to TE. Guard them for BOTH new-format routes.
     for name in (

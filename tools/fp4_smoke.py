@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import traceback
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +82,11 @@ def _source_fingerprints():
         "primus/backends/megatron/patches/two_level_fp4_patches.py",
         "third_party/Megatron-LM/megatron/core/transformer/moe/moe_utils.py",
     ]
+    files.extend(
+        str(path.relative_to(root))
+        for path in sorted((root / "primus/backends/megatron/core/optimizer").glob("*fp4*shard*.py"))
+        if str(path.relative_to(root)) not in files
+    )
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in files}
 
 
@@ -102,6 +108,9 @@ def parse_args(argv=None):
     parser.add_argument("--glu-clamp", type=float, default=None)
     parser.add_argument("--glu-offset", type=float, default=0.0)
     parser.add_argument("--deosc", action="store_true")
+    parser.add_argument("--distributed-optimizer", action="store_true")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--deosc-accumulator-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument(
         "--deterministic",
         action="store_true",
@@ -120,6 +129,10 @@ def parse_args(argv=None):
         parser.error("glu-clamp must be positive")
     if args.batch_size <= 0 or args.vocab_size < 8 or args.vocab_size % 8 or args.lr <= 0:
         parser.error("batch-size/lr must be positive and vocab-size must be a positive multiple of eight")
+    if args.gradient_accumulation_steps < 1:
+        parser.error("gradient-accumulation-steps must be positive")
+    if args.distributed_optimizer and args.checkpoint_format != "torch_dist":
+        parser.error("distributed optimizer smoke requires --checkpoint-format torch_dist")
     return args
 
 
@@ -189,6 +202,9 @@ def _make_config(args):
     config.fp4_backend = "reference"
     config.fp4_rng_seed = args.seed
     config.fp4_quantizer = args.quantizer
+    config.use_distributed_optimizer = args.distributed_optimizer
+    config.weight_deosc = args.deosc
+    config.weight_deosc_accumulator_dtype = args.deosc_accumulator_dtype
     config.enable_primus_turbo = False
     config.use_turbo_gemm = False
     config.use_turbo_grouped_gemm = False
@@ -347,7 +363,7 @@ def _build_training_objects(args, config):
     )
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
-    from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
     from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 
     from primus.backends.megatron.core.fp4_state import bind_fp4_model
@@ -368,17 +384,37 @@ def _build_training_objects(args, config):
         DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
             overlap_grad_reduce=True,
-            use_distributed_optimizer=False,
+            use_distributed_optimizer=args.distributed_optimizer,
+            overlap_param_gather=False,
             bucket_size=40_000_000,
         ),
         model,
     )
-    optimizer = Float16OptimizerWithFloat16Params(
-        torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0, foreach=False),
-        OptimizerConfig(bf16=True, params_dtype=torch.bfloat16, lr=args.lr, clip_grad=0.0),
-        grad_scaler=None,
-        init_state_fn=_initialize_adam_state,
-    )
+    if args.distributed_optimizer:
+        # Use the real MCore construction path, including separate expert and
+        # dense leaf optimizers and the actual DDP buffer partition mapping.
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                lr=args.lr,
+                clip_grad=0.0,
+                adam_beta1=0.9,
+                adam_beta2=0.95,
+                weight_decay=0.0,
+                use_distributed_optimizer=True,
+            ),
+            [ddp],
+        )
+    else:
+        optimizer = Float16OptimizerWithFloat16Params(
+            torch.optim.Adam(
+                model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0, foreach=False
+            ),
+            OptimizerConfig(bf16=True, params_dtype=torch.bfloat16, lr=args.lr, clip_grad=0.0),
+            grad_scaler=None,
+            init_state_fn=_initialize_adam_state,
+        )
     runners = []
     if args.deosc:
         from primus.backends.megatron.core.optimizer.two_level_fp4_deosc import (
@@ -398,6 +434,8 @@ def _build_training_objects(args, config):
                 expert_model_parallel_size=1,
                 context_parallel_size=1,
                 data_parallel_size=dist.get_world_size(),
+                use_distributed_optimizer=args.distributed_optimizer,
+                weight_deosc_accumulator_dtype=args.deosc_accumulator_dtype,
             ),
         )
         if not runners:
@@ -453,7 +491,20 @@ def _assert_equal(left, right, label):
         raise AssertionError(f"Checkpoint replay value differs: {label}")
 
 
-def _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step, vocab_size):
+def _step(
+    model,
+    ddp,
+    optimizer,
+    input_ids,
+    position_ids,
+    mask,
+    labels,
+    step,
+    vocab_size,
+    *,
+    distributed_optimizer=False,
+    gradient_accumulation_steps=1,
+):
     import torch
     import torch.distributed as dist
 
@@ -461,39 +512,79 @@ def _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step, vo
     started = time.perf_counter()
     optimizer.zero_grad()
     ddp.zero_grad_buffer()
-    logits = ddp(input_ids, position_ids, mask)
-    loss = torch.nn.functional.cross_entropy(logits.float().reshape(-1, vocab_size), labels.flatten())
-    if not torch.isfinite(loss):
-        raise AssertionError("Non-finite language model cross entropy")
-    loss.backward()
+    loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+    for microbatch in range(gradient_accumulation_steps):
+        context = ddp.no_sync() if microbatch + 1 < gradient_accumulation_steps else nullcontext()
+        with context:
+            logits = ddp(input_ids, position_ids, mask)
+            micro_loss = (
+                torch.nn.functional.cross_entropy(logits.float().reshape(-1, vocab_size), labels.flatten())
+                / gradient_accumulation_steps
+            )
+            if not torch.isfinite(micro_loss):
+                raise AssertionError("Non-finite language model cross entropy")
+            micro_loss.backward()
+            loss.add_(micro_loss.detach())
     ddp.finish_grad_sync()
     average_loss = loss.detach().clone()
     dist.all_reduce(average_loss)
     average_loss.div_(dist.get_world_size())
+    gradient_summary = _gradient_summary(model)
+    if distributed_optimizer:
+        # Only owned intervals contain reduced gradients after ReduceScatter.
+        # Do not label the norm of the entire backing buffer as a global norm.
+        gradient_summary["buffer_grad_norm"] = gradient_summary.pop("global_grad_norm")
     row = {
         "step": step + 1,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         "loss": float(loss.detach()),
         "dp_average_loss": float(average_loss),
-        **_gradient_summary(model),
-        "gradient_sync": _assert_replicated(
+        **gradient_summary,
+    }
+    if not distributed_optimizer:
+        row["gradient_sync"] = _assert_replicated(
             (
                 (name, parameter.main_grad)
                 for name, parameter in model.named_parameters()
                 if parameter.requires_grad
             ),
             "main_grad",
-        ),
-    }
+        )
     success, _, _ = optimizer.step()
     if not success:
         raise AssertionError("Optimizer skipped an update")
     if any(not _finite(param) for param in model.parameters()):
         raise AssertionError("Non-finite model parameter after optimizer update")
     row["parameter_sync"] = _assert_replicated(model.named_parameters(), "model parameters")
-    row["master_sync"] = _assert_replicated(
-        ((str(index), parameter) for index, parameter in enumerate(optimizer.get_parameters())),
-        "FP32 masters",
-    )
+    if distributed_optimizer:
+        masters = list(optimizer.get_parameters())
+        local_elements = sum(parameter.numel() for parameter in masters)
+        global_elements = torch.tensor(local_elements, dtype=torch.int64, device=input_ids.device)
+        dist.all_reduce(global_elements)
+        expected_elements = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if int(global_elements) != expected_elements:
+            raise AssertionError("Optimizer shards do not cover the complete trainable model exactly")
+        gradient_squares = torch.zeros((), dtype=torch.float64, device=input_ids.device)
+        for parameter in masters:
+            if parameter.dtype != torch.float32 or not _finite(parameter):
+                raise AssertionError("Invalid local FP32 optimizer shard")
+            if parameter.grad is None or not _finite(parameter.grad):
+                raise AssertionError("Missing or non-finite reduced optimizer gradient shard")
+            gradient_squares.add_(_squared_norm(parameter.grad))
+        dist.all_reduce(gradient_squares)
+        row["global_grad_norm"] = float(gradient_squares.sqrt())
+        row["gradient_sync"] = {"status": "reduce_scatter", "finite_owned_gradients": True}
+        row["master_sync"] = {
+            "status": "partitioned",
+            "local_elements": local_elements,
+            "global_elements": int(global_elements),
+            "coverage_exact": True,
+        }
+    else:
+        row["master_sync"] = _assert_replicated(
+            ((str(index), parameter) for index, parameter in enumerate(optimizer.get_parameters())),
+            "FP32 masters",
+        )
     torch.cuda.synchronize()
     row["elapsed_seconds_including_checks"] = time.perf_counter() - started
     return row
@@ -546,12 +637,39 @@ def _load_checkpoint(args, model, optimizer, directory, iteration):
     dist.barrier()
 
 
+def _optimizer_leaves(optimizer):
+    children = getattr(optimizer, "chained_optimizers", None)
+    if children is None:
+        yield optimizer
+    else:
+        for child in children:
+            yield from _optimizer_leaves(child)
+
+
+def _complete_optimizer_state(optimizer):
+    # DistributedOptimizer.state_dict intentionally omits the parameter state,
+    # which is saved by a separate sharded-checkpoint path. Include real local
+    # masters and inner Adam moments here so an exact-replay assertion cannot
+    # accidentally succeed by comparing only metadata.
+    return {
+        "wrapper_state": optimizer.state_dict(),
+        "leaves": [
+            {
+                "wrapper": type(leaf).__name__,
+                "inner_state": leaf.optimizer.state_dict() if leaf.optimizer is not None else None,
+                "fp32_masters": list(leaf.get_parameters()),
+            }
+            for leaf in _optimizer_leaves(optimizer)
+        ],
+    }
+
+
 def _training_fingerprints(model, optimizer, *, include_gradients=True):
     from primus.backends.megatron.core.fp4_state import fp4_state_dict
 
     fingerprints = {
         "model": _state_fingerprint(model.state_dict()),
-        "optimizer_and_fp32_masters": _state_fingerprint(optimizer.state_dict()),
+        "optimizer_and_fp32_masters": _state_fingerprint(_complete_optimizer_state(optimizer)),
         "private_rng_and_deosc": _state_fingerprint(fp4_state_dict(model, optimizer)),
         "global_rng": _state_fingerprint(_rng_state()),
     }
@@ -598,8 +716,8 @@ def run(args, result):
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size not in (1, 2):
-        raise RuntimeError("The reference smoke supports one or two replicated DP ranks")
+    if world_size not in (1, 2, 4, 8):
+        raise RuntimeError("The reference smoke supports one, two, four or eight DP ranks")
     if not torch.cuda.is_available() or torch.cuda.device_count() != world_size:
         raise RuntimeError("Expose exactly one GPU per local torchrun rank using ROCR_VISIBLE_DEVICES")
     torch.cuda.set_device(local_rank)
@@ -663,12 +781,14 @@ def run(args, result):
                 raise AssertionError("Expected FP32 optimizer master parameters")
             result["optimizer"] = {
                 "wrapper": type(optimizer).__name__,
-                "inner": type(optimizer.optimizer).__name__,
+                "inner": [type(leaf.optimizer).__name__ for leaf in _optimizer_leaves(optimizer)],
                 "master_parameter_count": len(masters),
                 "master_element_count": sum(parameter.numel() for parameter in masters),
                 "ddp": type(ddp).__name__,
                 "overlap_grad_reduce": True,
-                "replicated_full_masters": True,
+                "replicated_full_masters": not args.distributed_optimizer,
+                "distributed_optimizer": args.distributed_optimizer,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "learning_rate": args.lr,
             }
             del masters
@@ -711,7 +831,19 @@ def run(args, result):
             torch.cuda.reset_peak_memory_stats()
             for step in range(args.steps):
                 result["steps"].append(
-                    _step(model, ddp, optimizer, input_ids, position_ids, mask, labels, step, args.vocab_size)
+                    _step(
+                        model,
+                        ddp,
+                        optimizer,
+                        input_ids,
+                        position_ids,
+                        mask,
+                        labels,
+                        step,
+                        args.vocab_size,
+                        distributed_optimizer=args.distributed_optimizer,
+                        gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    )
                 )
                 if step + 1 == checkpoint_step:
                     result["checkpoint_saved_state_sha256"] = _training_fingerprints(
@@ -765,6 +897,8 @@ def run(args, result):
                     labels,
                     step,
                     args.vocab_size,
+                    distributed_optimizer=args.distributed_optimizer,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
                 )
                 for step in range(checkpoint_step, args.steps)
             ]

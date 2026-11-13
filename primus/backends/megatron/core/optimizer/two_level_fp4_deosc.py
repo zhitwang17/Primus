@@ -1,10 +1,11 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""Full-parameter DeOsc for the NVFP4/AMDFP4 reference adapters.
+"""DeOsc for the NVFP4/AMDFP4 reference adapters.
 
-The detector retains Primus' BF16 snapshot/delta policy and FP32 distance
-accumulators. Its QDQ is the *forward* two-level weight QDQ, including BF16
+The detector retains Primus' BF16 snapshot/delta policy and defaults to FP32
+distance accumulators. Explicit BF16 accumulation reproduces ALTO's distance
+policy. Its QDQ is the *forward* two-level weight QDQ, including BF16
 pre-rounding, block16/16x16 and whole expert-bank outer scale. There is no
 MXFP4 import, boundary-shard approximation, stochastic rounding or RNG use.
 
@@ -12,8 +13,9 @@ Call ``step`` after a successful optimizer update and before master-to-model
 copy. At a period boundary the master is snapped to current BF16 QDQ centers;
 then QDQ is recomputed over the entire weight because its dynamic scale may
 change. A checkpoint records the numerical recipe and snapshot policy as well
-as each observation window. Replicated DP masters are supported; partial
-optimizer shards are deliberately refused.
+as each observation window. Replicated masters use ``TwoLevelDeOsc``;
+DistributedOptimizer shards use the exact collective implementation in
+``two_level_fp4_deosc_shard``. Neither path approximates boundary blocks.
 """
 
 from __future__ import annotations
@@ -48,7 +50,17 @@ class TwoLevelDeOsc:
     is a successful optimizer-update index (0 begins on the first update).
     """
 
-    def __init__(self, bindings, *, period=200, ratio=4.0, start_step=0, active_modules=None):
+    def __init__(
+        self,
+        bindings,
+        *,
+        period=200,
+        ratio=4.0,
+        start_step=0,
+        active_modules=None,
+        accumulator_dtype="fp32",
+        epsilon=None,
+    ):
         if type(period) is not int or period <= 0:
             raise ValueError("weight_deosc_period must be a positive integer")
         if isinstance(ratio, bool) or not math.isfinite(ratio) or ratio <= 0:
@@ -61,28 +73,56 @@ class TwoLevelDeOsc:
         self.active_modules = None if active_modules is None else dict(active_modules)
         if self.active_modules is not None and set(self.active_modules) != set(self.bindings):
             raise ValueError("DeOsc owning modules must cover all parameter bindings")
+        dtype_names = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            torch.float32: torch.float32,
+            torch.bfloat16: torch.bfloat16,
+        }
+        if accumulator_dtype not in dtype_names:
+            raise ValueError("DeOsc accumulator_dtype must be fp32 or bf16")
+        self.accumulator_dtype = dtype_names[accumulator_dtype]
+        if epsilon is None:
+            epsilon = 1e-30 if self.accumulator_dtype == torch.bfloat16 else _EPS
+        if isinstance(epsilon, bool) or not math.isfinite(epsilon) or epsilon <= 0:
+            raise ValueError("DeOsc epsilon must be finite and positive")
+        self.epsilon = float(epsilon)
         self.period, self.ratio, self.start_step = period, float(ratio), start_step
         self.step_count = 0
         self._states = {}
         self._stats = {"observations": 0, "periods": 0, "snapped": 0}
         seen_models, seen_masters = set(), set()
         for key, (model, master, config) in self.bindings.items():
-            if not isinstance(config, TwoLevelFP4Config):
-                raise ValueError(f"{key}: DeOsc requires an explicit two-level FP4 recipe")
-            if not isinstance(model, torch.Tensor) or model.ndim not in (2, 3):
-                raise ValueError(f"{key}: DeOsc needs a full 2-D weight or 3-D expert bank")
-            if model.dtype != torch.bfloat16:
-                raise ValueError(f"{key}: DeOsc requires BF16 model weights")
-            if not isinstance(master, torch.Tensor) or master.dtype != torch.float32:
-                raise ValueError(f"{key}: DeOsc requires an explicit FP32 master")
-            if master.numel() != model.numel() or not master.is_contiguous():
-                raise ValueError(f"{key}: partial/noncontiguous master shards are unsupported")
-            if model.device != master.device:
-                raise ValueError(f"{key}: model and master must reside on the same device")
+            self._validate_binding(key, model, master, config)
             if id(model) in seen_models or id(master) in seen_masters:
                 raise ValueError("DeOsc bindings must not duplicate a model or master parameter")
             seen_models.add(id(model))
             seen_masters.add(id(master))
+
+    def _validate_binding(self, key, model, master, config):
+        if not isinstance(config, TwoLevelFP4Config):
+            raise ValueError(f"{key}: DeOsc requires an explicit two-level FP4 recipe")
+        if not isinstance(model, torch.Tensor) or model.ndim not in (2, 3):
+            raise ValueError(f"{key}: DeOsc needs a full 2-D weight or 3-D expert bank")
+        if model.dtype != torch.bfloat16:
+            raise ValueError(f"{key}: DeOsc requires BF16 model weights")
+        if not isinstance(master, torch.Tensor) or master.dtype != torch.float32:
+            raise ValueError(f"{key}: DeOsc requires an explicit FP32 master")
+        if master.numel() != model.numel() or not master.is_contiguous():
+            raise ValueError(f"{key}: partial/noncontiguous master shards are unsupported")
+        if model.device != master.device:
+            raise ValueError(f"{key}: model and master must reside on the same device")
+
+    def _master_view(self, model, master):
+        return master.view_as(model)
+
+    def _state_shape(self, key):
+        return self.bindings[key][0].shape
+
+    def _active_bindings(self):
+        return {key: self._active(key, cfg) for key, (_, _, cfg) in self.bindings.items()}
 
     @property
     def stats(self):
@@ -94,9 +134,19 @@ class TwoLevelDeOsc:
         return {
             "version": 2,
             "algorithm": _ALGORITHM,
-            "snapshot_policy": _SNAPSHOT_POLICY,
+            "snapshot_policy": (
+                "bf16-snapshots-bf16-deltas-"
+                + ("bf16" if self.accumulator_dtype == torch.bfloat16 else "fp32")
+                + "-accumulators"
+            ),
             "rng_policy": _RNG_POLICY,
-            "settings": {"period": self.period, "ratio": self.ratio, "start_step": self.start_step},
+            "settings": {
+                "period": self.period,
+                "ratio": self.ratio,
+                "start_step": self.start_step,
+                "accumulator_dtype": str(self.accumulator_dtype),
+                "epsilon": self.epsilon,
+            },
             "bindings": {
                 key: {
                     "shape": list(model.shape),
@@ -128,7 +178,7 @@ class TwoLevelDeOsc:
     @torch.no_grad()
     def step(self):
         """Observe one successful master update; never perform the model copy."""
-        active = {key: self._active(key, cfg) for key, (_, _, cfg) in self.bindings.items()}
+        active = self._active_bindings()
         self.step_count += 1
         if self.step_count < max(1, self.start_step):
             return self.stats
@@ -136,7 +186,7 @@ class TwoLevelDeOsc:
             if not active[key]:
                 self._states.pop(key, None)
                 continue
-            current = master.view_as(model).to(torch.bfloat16)
+            current = self._master_view(model, master).to(torch.bfloat16)
             quantized = self._weight_qdq(master, model, config)
             self._stats["observations"] += 1
             state = self._states.get(key)
@@ -144,8 +194,8 @@ class TwoLevelDeOsc:
                 self._states[key] = {
                     "prev": current.clone(),
                     "prev_q": quantized.clone(),
-                    "dist_w": torch.zeros_like(current, dtype=torch.float32),
-                    "dist_q": torch.zeros_like(current, dtype=torch.float32),
+                    "dist_w": torch.zeros_like(current, dtype=self.accumulator_dtype),
+                    "dist_q": torch.zeros_like(current, dtype=self.accumulator_dtype),
                     "window_steps": 0,
                 }
                 continue
@@ -155,9 +205,9 @@ class TwoLevelDeOsc:
             state["window_steps"] += 1
             if state["window_steps"] == self.period:
                 mask = (state["dist_w"] > 0) & (
-                    state["dist_q"] / state["dist_w"].clamp_min(_EPS) >= self.ratio
+                    state["dist_q"] / state["dist_w"].clamp_min(self.epsilon) >= self.ratio
                 )
-                master_view = master.view_as(model)
+                master_view = self._master_view(model, master)
                 master_view.copy_(torch.where(mask, quantized.float(), master_view))
                 self._stats["snapped"] += int(mask.sum().item())
                 self._stats["periods"] += 1
@@ -225,7 +275,7 @@ class TwoLevelDeOsc:
         if saved["step_count"] == 0 and states:
             raise ValueError("Unstarted DeOsc checkpoint cannot contain observation windows")
         for key, state in states.items():
-            shape = self.bindings[key][0].shape
+            shape = self._state_shape(key)
             if not isinstance(state, dict) or set(state) != {
                 "prev",
                 "prev_q",
@@ -239,8 +289,8 @@ class TwoLevelDeOsc:
             for name, dtype in (
                 ("prev", torch.bfloat16),
                 ("prev_q", torch.bfloat16),
-                ("dist_w", torch.float32),
-                ("dist_q", torch.float32),
+                ("dist_w", self.accumulator_dtype),
+                ("dist_q", self.accumulator_dtype),
             ):
                 value = state[name]
                 if not isinstance(value, torch.Tensor) or value.shape != shape or value.dtype != dtype:
@@ -320,6 +370,121 @@ def _pairs(opt):
         yield from zip(model_group, master_group)
 
 
+def _logical_weight_key(key):
+    """DeOsc has no rank-local RNG; collective keys use logical model names."""
+    prefix, separator, rest = key.partition("/")
+    return rest if separator and prefix.startswith("rank") and prefix[4:].isdigit() else key
+
+
+def _distributed_bindings_local(opt, weights):
+    """Read actual MCore bucket membership and parameter-coordinate shard ranges.
+
+    ``model_float16_groups`` contains only locally owned parameters. In
+    contrast, every ``buffer.param_index_map`` contains all logical parameters
+    in that optimizer buffer, including zero-owner weights on this rank.
+    Neither bucket offsets nor grad-buffer padding are parameter coordinates.
+    """
+    from .two_level_fp4_deosc_shard import FP4ShardBinding
+
+    buffers = getattr(opt, "buffers", None)
+    range_map = getattr(opt, "_get_model_param_range_map", None)
+    if buffers is None or not callable(range_map):
+        raise ValueError("Sharded DeOsc needs Megatron buffers and model-parameter range mapping")
+    membership, groups = set(), []
+    for buffer in buffers:
+        parameters = getattr(buffer, "param_index_map", None)
+        if parameters is None:
+            raise ValueError("Sharded DeOsc needs each Megatron buffer's complete param_index_map")
+        tracked = {id(parameter) for parameter in parameters} & set(weights)
+        if tracked:
+            membership.update(tracked)
+            groups.append(getattr(buffer, "data_parallel_group", getattr(opt, "data_parallel_group", None)))
+    if not membership:
+        return {}, {}, None, set()
+    group = groups[0]
+    # DistOpt buffers can use an intra-instance subgroup. Use the group which
+    # actually partitions their ranges, rather than assuming global DP/WORLD.
+    if torch.distributed.is_initialized():
+
+        def group_members(value):
+            if value is None:
+                return tuple(range(torch.distributed.get_world_size()))
+            return tuple(torch.distributed.get_process_group_ranks(value))
+
+        if any(group_members(value) != group_members(group) for value in groups):
+            raise ValueError("One DeOsc leaf optimizer cannot mix differently partitioned DP groups")
+    elif any(value is not None for value in groups):
+        raise ValueError("Sharded DeOsc process groups require initialized torch.distributed")
+    local_pairs = {}
+    for parameter, master in _pairs(opt):
+        if id(parameter) in local_pairs:
+            raise ValueError("A model parameter has multiple local FP32 master shards")
+        local_pairs[id(parameter)] = master
+    bindings, owners = {}, {}
+    for parameter_id in sorted(membership, key=lambda value: _logical_weight_key(weights[value][0])):
+        key, parameter, config, module = weights[parameter_id]
+        key = _logical_weight_key(key)
+        if key in bindings:
+            raise ValueError(f"Duplicate logical sharded DeOsc parameter key: {key}")
+        if parameter_id in local_pairs:
+            master = local_pairs[parameter_id]
+            if (
+                not isinstance(master, torch.Tensor)
+                or master.dtype != torch.float32
+                or not master.is_contiguous()
+            ):
+                raise ValueError(f"{key}: DeOsc needs an explicit contiguous FP32 master shard")
+            coordinates = range_map(parameter)["param"]
+            start, end = coordinates.start, coordinates.end
+            if end - start != master.numel():
+                raise ValueError(f"{key}: Megatron parameter range differs from its FP32 master size")
+            master = master.view(-1)
+        else:
+            # Absence is valid only for a genuine non-owner, never as a silent
+            # substitute for a missing optimizer master mapping.
+            if parameter in getattr(opt, "model_param_gbuf_map", {}):
+                raise ValueError(f"{key}: owned parameter is missing its FP32 master")
+            master = torch.empty(0, dtype=torch.float32, device=parameter.device)
+            start = end = 0
+        bindings[key] = FP4ShardBinding(parameter, master, config, start, end)
+        owners[key] = module
+    return bindings, owners, group, membership
+
+
+def _distributed_bindings(opt, weights):
+    """Make rank-local optimizer mapping failures collective before installation."""
+    group = getattr(opt, "data_parallel_group", None)
+    error, result = None, None
+    try:
+        buffers = getattr(opt, "buffers", None)
+        if buffers:
+            # These groups are present even when this rank owns no part of a
+            # tracked parameter. Establish the collective before reading the
+            # rank-local master/range map, which may be malformed on one rank.
+            for buffer in buffers:
+                parameters = getattr(buffer, "param_index_map", {})
+                if any(id(parameter) in weights for parameter in parameters):
+                    group = getattr(buffer, "data_parallel_group", group)
+                    break
+        result = _distributed_bindings_local(opt, weights)
+    except Exception as exception:
+        error = f"{type(exception).__name__}: {exception}"
+    payload = {"error": error, "keys": sorted(result[0]) if result is not None else None}
+    initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+    world_size = torch.distributed.get_world_size(group) if initialized else 1
+    gathered = [None] * world_size
+    if world_size > 1:
+        torch.distributed.all_gather_object(gathered, payload, group=group)
+    else:
+        gathered[0] = payload
+    errors = [f"group rank {rank}: {item['error']}" for rank, item in enumerate(gathered) if item["error"]]
+    if errors:
+        raise ValueError("Sharded DeOsc optimizer mapping failed: " + "; ".join(errors))
+    if any(item["keys"] != gathered[0]["keys"] for item in gathered):
+        raise ValueError("Sharded DeOsc optimizer buffers disagree on logical parameter membership")
+    return result
+
+
 def _wrap_optimizer(opt, runner):
     original_step = opt.step_with_ready_grads
     original_copy = opt._copy_main_params_to_model_params
@@ -359,8 +524,8 @@ def _wrap_optimizer(opt, runner):
 def install_megatron_deosc(optimizer, models, args):
     """Install on supported leaf optimizers; return runners for checkpointing.
 
-    Supports ordinary Float16OptimizerWithFloat16Params and full DP1 masters
-    in DistributedOptimizer. Constructor/load-time copies remain untouched.
+    Supports ordinary Float16OptimizerWithFloat16Params and explicitly mapped
+    DistributedOptimizer master shards. Constructor/load-time copies remain untouched.
     Configuration or binding errors raise, including missing tracked weights;
     no partial best-effort installation or hidden MXFP4 fallback is allowed.
     """
@@ -377,19 +542,9 @@ def install_megatron_deosc(optimizer, models, args):
     ):
         if _get(args, name, 1) not in (None, 1):
             raise ValueError(f"Two-level FP4 DeOsc currently requires {name}=1")
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    dp_size = max(world_size, _get(args, "data_parallel_size", 1) or 1)
-    if dp_size > 1:
-        if _get(args, "use_distributed_optimizer", False) or any(
-            hasattr(opt, "model_float16_groups") for opt in _leaf_optimizers(optimizer)
-        ):
-            raise ValueError(
-                "FP4 DeOsc with DP>1 requires replicated full FP32 masters, not optimizer shards"
-            )
     for name in (
         "weight_deosc_fusion",
         "weight_deosc_direct_qdq",
-        "use_precision_aware_optimizer",
         "use_precision_aware_optimizer_no_fp8_or_ds_fp8",
         "optimizer_cpu_offload",
         "reuse_grad_buf_for_mxfp8_param_ag",
@@ -405,13 +560,46 @@ def install_megatron_deosc(optimizer, models, args):
             raise ValueError("Two-level FP4 DeOsc is already installed on a leaf optimizer")
         opt_config = getattr(opt, "config", None)
         for name in (
-            "use_precision_aware_optimizer",
             "use_precision_aware_optimizer_no_fp8_or_ds_fp8",
             "optimizer_cpu_offload",
             "reuse_grad_buf_for_mxfp8_param_ag",
         ):
             if _get(opt_config, name, False):
                 raise ValueError(f"Two-level FP4 DeOsc does not support optimizer {name}")
+        options = dict(
+            period=_get(args, "weight_deosc_period", 200),
+            ratio=_get(args, "weight_deosc_ratio", 4.0),
+            start_step=_get(args, "weight_deosc_start_step", 0),
+            accumulator_dtype=_get(args, "weight_deosc_accumulator_dtype", "fp32"),
+            epsilon=_get(args, "weight_deosc_epsilon", None),
+        )
+        is_distributed = hasattr(opt, "model_float16_groups")
+        if _get(args, "use_distributed_optimizer", False) and not is_distributed:
+            raise ValueError("Configured distributed optimizer lacks Megatron FP32 shard metadata")
+        if is_distributed and hasattr(opt, "buffers"):
+            from .two_level_fp4_deosc_shard import ShardedTwoLevelDeOsc
+
+            shard_bindings, owners, group, membership = _distributed_bindings(opt, weights)
+            if not shard_bindings:
+                continue
+            if matched & membership:
+                raise ValueError("FP4 parameter appears in multiple distributed optimizers")
+            matched.update(membership)
+            runner = ShardedTwoLevelDeOsc(
+                shard_bindings, process_group=group, active_modules=owners, **options
+            )
+            if getattr(opt, "is_stub_optimizer", False):
+                raise ValueError("DeOsc cannot run on a stub optimizer")
+            if not callable(getattr(opt, "step_with_ready_grads", None)) or not callable(
+                getattr(opt, "_copy_main_params_to_model_params", None)
+            ):
+                raise ValueError("DeOsc requires the Megatron successful-step/main-to-model-copy boundary")
+            pending.append((opt, runner))
+            continue
+        if is_distributed:
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if max(world_size, _get(args, "data_parallel_size", 1) or 1) > 1:
+                raise ValueError("Sharded DeOsc requires complete Megatron buffers/range metadata")
         bindings, owners = {}, {}
         for model_param, master in _pairs(opt):
             entry = weights.get(id(model_param))
@@ -433,10 +621,8 @@ def install_megatron_deosc(optimizer, models, args):
             raise ValueError("DeOsc requires the Megatron successful-step/main-to-model-copy boundary")
         runner = TwoLevelDeOsc(
             bindings,
-            period=_get(args, "weight_deosc_period", 200),
-            ratio=_get(args, "weight_deosc_ratio", 4.0),
-            start_step=_get(args, "weight_deosc_start_step", 0),
             active_modules=owners,
+            **options,
         )
         pending.append((opt, runner))
     if matched != set(weights):

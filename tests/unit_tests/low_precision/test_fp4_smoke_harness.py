@@ -40,6 +40,7 @@ def test_profile_defaults_and_backward_compatible_tiny():
     base = ["--recipe", "nvfp4", "--output", "/tmp/result.json"]
     tiny = SMOKE.parse_args(base)
     assert (tiny.batch_size, tiny.seq_length, tiny.lr) == (2, 64, 0.002)
+    assert tiny.gradient_accumulation_steps == 1 and tiny.deosc_accumulator_dtype == "fp32"
     assert SMOKE.model_geometry("tiny")["layer_pattern"] == [0, 1]
     full = SMOKE.parse_args(base + ["--model-profile", "gpt-oss", "--quantizer", "triton"])
     assert (full.batch_size, full.seq_length, full.lr, full.quantizer) == (1, 32, 5.7e-4, "triton")
@@ -50,6 +51,35 @@ def test_profile_defaults_and_backward_compatible_tiny():
 def test_invalid_scale_options_rejected(extra):
     with pytest.raises(SystemExit):
         SMOKE.parse_args(["--recipe", "nvfp4", "--output", "/tmp/result.json", *extra])
+
+
+def test_distributed_optimizer_requires_distributed_checkpoint_and_allows_accumulation():
+    base = ["--recipe", "nvfp4", "--output", "/tmp/result.json", "--distributed-optimizer"]
+    with pytest.raises(SystemExit):
+        SMOKE.parse_args(base)
+    options = SMOKE.parse_args(
+        base
+        + [
+            "--checkpoint-format",
+            "torch_dist",
+            "--gradient-accumulation-steps",
+            "4",
+            "--deosc-accumulator-dtype",
+            "bf16",
+        ]
+    )
+    assert options.distributed_optimizer
+    assert options.checkpoint_format == "torch_dist"
+    assert options.gradient_accumulation_steps == 4
+    assert options.deosc_accumulator_dtype == "bf16"
+
+
+@pytest.mark.parametrize("count", ["0", "-1"])
+def test_smoke_rejects_nonpositive_accumulation(count):
+    with pytest.raises(SystemExit):
+        SMOKE.parse_args(
+            ["--recipe", "amdfp4", "--output", "/tmp/result.json", "--gradient-accumulation-steps", count]
+        )
 
 
 def test_complete_fingerprint_detects_unsampled_values_dtype_shape_and_metadata(monkeypatch):
@@ -65,6 +95,39 @@ def test_complete_fingerprint_detects_unsampled_values_dtype_shape_and_metadata(
     assert SMOKE._state_fingerprint(tensor) != SMOKE._state_fingerprint(tensor.to(torch.bfloat16))
     matrix = torch.arange(12).reshape(3, 4)
     assert SMOKE._state_fingerprint(matrix.t()) == SMOKE._state_fingerprint(matrix.t().contiguous())
+
+
+def test_distributed_optimizer_fingerprint_includes_master_and_moments_hidden_by_wrapper(monkeypatch):
+    monkeypatch.setattr(SMOKE, "_CHECK_CHUNK_ELEMENTS", 4)
+    master = torch.nn.Parameter(torch.zeros(13))
+    adam = torch.optim.Adam([master], lr=0.01, foreach=False)
+    SMOKE._initialize_adam_state(adam)
+
+    class MetadataOnlyOptimizer:
+        optimizer = adam
+
+        def state_dict(self):
+            return {"param_state_sharding_type": "dp_zero_gather_scatter", "step": 7}
+
+        def get_parameters(self):
+            return [master]
+
+    optimizer = MetadataOnlyOptimizer()
+    wrapper_before = SMOKE._state_fingerprint(optimizer.state_dict())
+    complete_before = SMOKE._state_fingerprint(SMOKE._complete_optimizer_state(optimizer))
+    with torch.no_grad():
+        master[-1] = 1.0
+    assert SMOKE._state_fingerprint(optimizer.state_dict()) == wrapper_before
+    assert SMOKE._state_fingerprint(SMOKE._complete_optimizer_state(optimizer)) != complete_before
+    with torch.no_grad():
+        master[-1] = 0.0
+    assert SMOKE._state_fingerprint(SMOKE._complete_optimizer_state(optimizer)) == complete_before
+    adam.state[master]["exp_avg"][-1] = 0.125
+    assert SMOKE._state_fingerprint(optimizer.state_dict()) == wrapper_before
+    assert SMOKE._state_fingerprint(SMOKE._complete_optimizer_state(optimizer)) != complete_before
+    adam.state[master]["exp_avg"][-1] = 0.0
+    adam.state[master]["exp_avg_sq"][-1] = 0.0625
+    assert SMOKE._state_fingerprint(SMOKE._complete_optimizer_state(optimizer)) != complete_before
 
 
 def test_adam_load_initialization_preserves_existing_moments():

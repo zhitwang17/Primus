@@ -74,7 +74,6 @@ def test_recipe_fragment_and_routes(recipe, inner, maximum, floor):
         {"fp4_backend": "turbo"},
         {"fp4_backend": "te", "use_turbo_gemm": True},
         {"turbo_fused_grouped_gemm": True},
-        {"weight_deosc": True, "data_parallel_size": 2, "use_distributed_optimizer": True},
         {"fp4_quantizer": "unsupported"},
         {"fp4_backend": "te", "fp4_quantizer": "triton"},
         {"fp4_backend": "auto", "fp4_quantizer": "triton"},
@@ -92,6 +91,14 @@ def test_recipe_fragment_and_routes(recipe, inner, maximum, floor):
 def test_invalid_combinations_rejected(update):
     with pytest.raises(ValueError):
         D.validate_fp4_options(options(**update), require_runtime=False)
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
+def test_deosc_allows_explicit_distributed_optimizer_configuration(recipe):
+    # The installer validates the actual process group and parameter shard map.
+    # Configuration validation must not reject DP solely because it shards state.
+    cfg = options(recipe, weight_deosc=True, data_parallel_size=3, use_distributed_optimizer=True)
+    D.validate_fp4_options(cfg, require_runtime=False)
 
 
 @pytest.mark.parametrize(
