@@ -731,6 +731,7 @@ def run(args, result):
 
     from primus.backends.megatron.core.fp4_autograd import execution_counts
     from primus.backends.megatron.core.fp4_dispatch import resolve_fp4_plan
+    from primus.backends.megatron.patches.attention_backend_patches import patch_attention_backend
     from primus.backends.megatron.patches.turbo.fp4_patches import patch_enums, patch_fp4_context
     from primus.backends.megatron.patches.two_level_fp4_patches import install_two_level_fp4_spec_provider
 
@@ -762,6 +763,10 @@ def run(args, result):
             torch.manual_seed(args.seed)
             tensor_parallel.model_parallel_cuda_manual_seed(args.seed)
             patch_enums(None)
+            if torch.version.hip is not None:
+                # Standalone smoke bypasses Primus's before_train patch manager.
+                # Reuse its ROCm policy so explicit unfused overrides image defaults.
+                patch_attention_backend(None)
             patch_fp4_context(None)
             install_two_level_fp4_spec_provider()
             config = _make_config(args)
