@@ -207,6 +207,33 @@ def test_admission_changes_detector_window_and_eval_without_shortening_data_hori
     assert admission["recompute_method"] == "uniform" and admission["recompute_num_layers"] == 1
 
 
+@pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4", "mxfp4"])
+def test_supplemental_dp4_keeps_full_model_and_global_batch(recipe):
+    _, default, original = _build(recipe, steps=8, admission=True)
+    _, actual, manifest = _build(recipe, steps=8, admission=True, supplemental_dp4=True)
+    assert actual == default
+    assert original["scope"] == "admission_only" and "expected_world_size" not in original
+    assert manifest["scope"] == "supplemental_dp4_admission"
+    assert manifest["expected_world_size"] == 4 and manifest["gradient_accumulation_steps"] == 2
+    assert manifest["environment"]["GPUS_PER_NODE"] == "4"
+    assert manifest["environment"]["DGXSYSTEM"] == "MI355X_1x4x1"
+    assert manifest["full_geometry"]["num_layers"] == 24
+    assert manifest["full_geometry"]["seq_length"] == 8192
+    assert actual["global_batch_size"] // (actual["micro_batch_size"] * 4) == 2
+    assert manifest["validation_steps"] == [4, 8]
+    assert manifest["deosc_settings"]["start_step"] == 0
+    assert manifest["deosc_settings"]["period"] == 2
+    assert manifest["full_schedule_train_iters"] == 1200000
+
+
+@pytest.mark.parametrize("invalid", [{"admission": False}, {"steps": 3000}, {"recompute": False}])
+def test_supplemental_dp4_rejects_other_scopes_and_shortcuts(invalid):
+    options = dict(steps=8, admission=True, supplemental_dp4=True)
+    options.update(invalid)
+    with pytest.raises(ValueError, match="Supplemental DP4"):
+        _build("nvfp4", **options)
+
+
 def test_gpu_rng_is_explicit_and_does_not_claim_an_mxfp4_rng_change():
     for recipe in ("nvfp4", "amdfp4"):
         _, args, manifest = _build(recipe, sr_rng="triton_philox")

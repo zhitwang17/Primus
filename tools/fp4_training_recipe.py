@@ -82,11 +82,14 @@ def build_recipe(
     workspace="/training/output",
     recompute=True,
     admission=False,
+    supplemental_dp4=False,
     sr_rng="torch_cpu",
     value_checks="strict",
 ):
     if recipe not in _RECIPES or type(steps) is not int or steps <= 0:
         raise ValueError("Expected mxfp4/nvfp4/amdfp4 and a positive optimizer-update limit")
+    if supplemental_dp4 and (not admission or steps != 8 or not recompute):
+        raise ValueError("Supplemental DP4 requires admission, exactly eight updates, and full recompute")
     if sr_rng not in ("torch_cpu", "triton_philox"):
         raise ValueError("Expected sr_rng=torch_cpu or triton_philox")
     if value_checks not in ("strict", "grouped_deferred"):
@@ -144,6 +147,8 @@ def build_recipe(
         # pending and the existing MX DeOsc warmup path is outside that wrapper.
         SYNTH_WARMUP_STEPS="0",
     )
+    if supplemental_dp4:
+        environment.update(GPUS_PER_NODE="4", DGXSYSTEM="MI355X_1x4x1")
     original = expand(yaml.safe_load(base.read_text()), environment)
     result = copy.deepcopy(original)
     result.update(
@@ -258,6 +263,37 @@ def build_recipe(
         },
         "environment": environment,
     }
+    if supplemental_dp4:
+        geometry = dict(
+            num_layers=24,
+            hidden_size=2880,
+            ffn_hidden_size=2880,
+            num_attention_heads=64,
+            num_query_groups=8,
+            num_experts=32,
+            seq_length=8192,
+            micro_batch_size=4,
+            global_batch_size=32,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+        if (
+            any(
+                overrides.get(key, 1 if key == "context_parallel_size" else None) != value
+                for key, value in geometry.items()
+            )
+            or overrides["train_iters"] != 1200000
+        ):
+            raise ValueError("Supplemental DP4 must retain the full default model, batch and schedule")
+        manifest.update(
+            scope="supplemental_dp4_admission",
+            expected_world_size=4,
+            gradient_accumulation_steps=2,
+            full_geometry=geometry,
+            comparison_boundary="Supplemental DP4 real-data full-model eight-update admission; not the DP8 default or a 3000-update comparison",
+        )
     return result, manifest
 
 
@@ -272,6 +308,7 @@ def main():
     parser.add_argument("--tokenizer-dir", default="/model")
     parser.add_argument("--recompute", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--admission", action="store_true")
+    parser.add_argument("--supplemental-dp4", action="store_true")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     args = parser.parse_args()
@@ -284,6 +321,7 @@ def main():
         tokenizer_dir=args.tokenizer_dir,
         recompute=args.recompute,
         admission=args.admission,
+        supplemental_dp4=args.supplemental_dp4,
         sr_rng=args.sr_rng,
         value_checks=args.value_checks,
     )
