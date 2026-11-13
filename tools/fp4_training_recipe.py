@@ -136,9 +136,9 @@ def build_recipe(
         MLLOG_TRAIN_LOSS_LOG_FREQ="10",
         MLLOG_SUBMISSION_DIVISION="open",
         MLLOG_OUTPUT_FILE="/training/mlperf_logging.out",
-        # The installed MLPerf warmup restores TE state, but not reference FP4
-        # private RNG counters or sharded DeOsc history. Do not count synthetic
-        # updates as training or let them affect the real-data trajectory.
+        # Keep the same no-warmup control for all three arms. Reference FP4 has
+        # a state-restoring wrapper, but its native GPU warmup qualification is
+        # pending and the existing MX DeOsc warmup path is outside that wrapper.
         SYNTH_WARMUP_STEPS="0",
     )
     original = expand(yaml.safe_load(base.read_text()), environment)
@@ -232,7 +232,7 @@ def build_recipe(
             "bounded_exit_status": "completed_update_limit",
             "validation_steps_are_planned": True,
         },
-        "synthetic_warmup": "disabled: installed MLPerf warmup does not restore reference FP4 private RNG or DeOsc history",
+        "synthetic_warmup": "disabled uniformly: isolate existing native MX DeOsc warmup; reference FP4 state-restoring wrapper is CPU-tested but native GPU warmup qualification remains pending",
         "validation_steps": list(
             range(int(overrides["eval_interval"]), steps + 1, int(overrides["eval_interval"]))
         ),

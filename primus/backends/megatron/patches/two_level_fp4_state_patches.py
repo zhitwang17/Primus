@@ -124,3 +124,33 @@ def install_two_level_fp4_training_state(args):
 )
 def patch_two_level_fp4_training_state(ctx: PatchContext):
     install_two_level_fp4_training_state(get_args(ctx))
+
+
+def install_two_level_fp4_warmup_state(warmup_module=None):
+    """The MLPerf trainer imports this function locally immediately before use."""
+    if warmup_module is None:
+        import importlib
+
+        try:
+            warmup_module = importlib.import_module("primus_mllog.warmup")
+        except ModuleNotFoundError as error:
+            if error.name in ("primus_mllog", "primus_mllog.warmup"):
+                return False  # Optional MLPerf plugin is not needed for ordinary training.
+            raise
+    from primus.backends.megatron.core.fp4_warmup import wrap_synthetic_warmup
+    from primus.core.utils.module_utils import log_rank_0
+
+    warmup_module.run_synthetic_warmup = wrap_synthetic_warmup(warmup_module.run_synthetic_warmup, log_rank_0)
+    return True
+
+
+@register_patch(
+    "megatron.two_level_fp4.warmup_state",
+    backend="megatron",
+    phase="before_train",
+    description="Restore reference FP4 state after synthetic warmup; skip warmup on continuation",
+    condition=_enabled,
+    priority=101,
+)
+def patch_two_level_fp4_warmup_state(ctx: PatchContext):
+    install_two_level_fp4_warmup_state()

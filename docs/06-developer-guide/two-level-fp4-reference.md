@@ -146,6 +146,28 @@ Nonpersistent checkpoints are unsupported. Grouped reference weights use the
 `weights[E,N,K]` schema; importing existing TE `weight{i}` checkpoints needs an
 explicit converter and is not implemented by this change.
 
+The optional MLPerf synthetic warmup is wrapped by a repository patch, without
+modifying `primus_mllog`. Fresh reference runs restore private FP4 RNG, DeOsc
+updates/windows/statistics, last-forward routing, and Python/NumPy/Torch/MCore
+RNG state after warmup. Both optimizer and arguments expose
+`_primus_fp4_warmup_active` during synthetic steps so observers can exclude them
+from successful real-update counts. Disabled warmup takes no snapshots or
+collectives. Non-reference routes, including MXFP4, retain their existing path.
+
+Continuation, an advanced scheduler/DeOsc detector, or existing optimizer state
+causes every DP rank to skip synthetic warmup: the installed implementation
+otherwise zeros Adam buffers unconditionally. Preallocated zero state also
+triggers this conservative skip; only performance warmup is omitted, and real
+training proceeds normally. The decision is collective so an empty-owner rank
+cannot enter warmup while peers skip it. Leave `WARMUP_RECIPE` and the legacy
+`WARMUP_FP8_RECIPE` empty for reference models; foreign TE autocast is rejected.
+Exceptions propagate after restoring FP4/RNG bookkeeping and flags. A failed
+external warmup does not guarantee model/Adam rollback and must abort the run.
+CPU tests execute the installed warmup body, compare the first real update
+with a run without warmup, protect nonzero Adam state, and check Gloo skip
+agreement. Production GPU warmup qualification remains separate; comparison
+recipes continue to disable synthetic warmup until that qualification.
+
 ## Optimizer-sharded DeOsc
 
 The installer reads complete parameter membership from each MCore DDP buffer's
