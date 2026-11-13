@@ -39,30 +39,31 @@ def _philox_uniform(seed, block_offset, logical_index):
 
 
 @triton.jit
-def _input_offsets(
-    index, ROWS: tl.constexpr, COLS: tl.constexpr, SB: tl.constexpr, SR: tl.constexpr, SC: tl.constexpr
-):
-    batch = index // (ROWS * COLS)
-    row = index // COLS % ROWS
-    col = index % COLS
+def _input_offsets(index, ROWS, COLS, SB, SR, SC):
+    # Runtime dimensions must not overflow int32 before pointer arithmetic.
+    index = index.to(tl.int64)
+    rows, cols = tl.cast(ROWS, tl.int64), tl.cast(COLS, tl.int64)
+    batch = index // (rows * cols)
+    row = index // cols % rows
+    col = index % cols
     return batch * SB + row * SR + col * SC
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "R", "C", "SB", "SR", "SC"])
 def _amax_input(
     X,
     PARTIAL,
     ERROR,
-    N: tl.constexpr,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    SB: tl.constexpr,
-    SR: tl.constexpr,
-    SC: tl.constexpr,
+    N,
+    R,
+    C,
+    SB,
+    SR,
+    SC,
     CHECK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(X + _input_offsets(idx, R, C, SB, SR, SC), idx < N, 0).to(tl.float32)
     finite = tl.abs(value) < float("inf")
     if CHECK:
@@ -73,8 +74,8 @@ def _amax_input(
     tl.store(PARTIAL + tl.program_id(0), tl.max(magnitude, 0))
 
 
-@triton.jit
-def _amax_reduce(X, OUT, N: tl.constexpr, FINAL: tl.constexpr, DENOM: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["N"])
+def _amax_reduce(X, OUT, N, FINAL: tl.constexpr, DENOM: tl.constexpr, BLOCK: tl.constexpr):
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     value = tl.max(tl.load(X + idx, idx < N, 0.0), 0)
     if FINAL:
@@ -83,19 +84,19 @@ def _amax_reduce(X, OUT, N: tl.constexpr, FINAL: tl.constexpr, DENOM: tl.constex
     tl.store(OUT + tl.program_id(0), value)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "R", "C", "SB", "SR", "SC"])
 def _validate_input_kernel(
     X,
     ERROR,
-    N: tl.constexpr,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    SB: tl.constexpr,
-    SR: tl.constexpr,
-    SC: tl.constexpr,
+    N,
+    R,
+    C,
+    SB,
+    SR,
+    SC,
     BLOCK: tl.constexpr,
 ):
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(X + _input_offsets(idx, R, C, SB, SR, SC), idx < N, 0).to(tl.float32)
     bad = tl.sum(((idx < N) & ~(tl.abs(value) < float("inf"))).to(tl.int32), 0)
     if bad:
@@ -171,7 +172,9 @@ def _e2m1_code(magnitude, uniform, STOCHASTIC: tl.constexpr):
         return code
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["RNG_SEED", "RNG_OFFSET", "R", "C", "RP", "CP", "SB", "SR", "SC", "OB", "OR", "OC"]
+)
 def _quantize_kernel(
     X,
     OUTER,
@@ -182,16 +185,16 @@ def _quantize_kernel(
     ERROR,
     RNG_SEED,
     RNG_OFFSET,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    RP: tl.constexpr,
-    CP: tl.constexpr,
-    SB: tl.constexpr,
-    SR: tl.constexpr,
-    SC: tl.constexpr,
-    OB: tl.constexpr,
-    OR: tl.constexpr,
-    OC: tl.constexpr,
+    R,
+    C,
+    RP,
+    CP,
+    SB,
+    SR,
+    SC,
+    OB,
+    OR,
+    OC,
     TWO_D: tl.constexpr,
     STOCHASTIC: tl.constexpr,
     GPU_RANDOM: tl.constexpr,
@@ -203,9 +206,9 @@ def _quantize_kernel(
     SUBNORMAL_INV: tl.constexpr,
     DEFERRED: tl.constexpr = False,
 ):
-    ct = CP // 16
-    rt = tl.cdiv(RP, 16)
-    pid = tl.program_id(0)
+    ct = tl.cast(CP, tl.int64) // 16
+    rt = tl.cdiv(tl.cast(RP, tl.int64), 16)
+    pid = tl.program_id(0).to(tl.int64)
     batch = pid // (rt * ct)
     tile_r = pid // ct % rt
     tile_c = pid % ct
@@ -281,27 +284,28 @@ def _quantize_kernel(
             tl.store(INNER + (batch * RP + rows) * ct + tile_c, inner, rows < RP)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "R", "C", "RP", "CP", "OB", "OR", "OC"])
 def _dequantize_kernel(
     PACKED,
     INNER,
     OUTER,
     OUT,
-    N: tl.constexpr,
-    R: tl.constexpr,
-    C: tl.constexpr,
-    RP: tl.constexpr,
-    CP: tl.constexpr,
-    OB: tl.constexpr,
-    OR: tl.constexpr,
-    OC: tl.constexpr,
+    N,
+    R,
+    C,
+    RP,
+    CP,
+    OB,
+    OR,
+    OC,
     TWO_D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    batch = idx // (R * C)
-    row = idx // C % R
-    col = idx % C
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    rows, cols = tl.cast(R, tl.int64), tl.cast(C, tl.int64)
+    batch = idx // (rows * cols)
+    row = idx // cols % rows
+    col = idx % cols
     byte = tl.load(PACKED + (batch * RP + row) * (CP // 2) + col // 2, idx < N, 0).to(tl.int32)
     code = (byte >> ((col % 2) * 4)) & 15
     if TWO_D:
