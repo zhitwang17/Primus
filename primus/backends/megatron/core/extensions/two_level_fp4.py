@@ -59,7 +59,18 @@ def _check_topology(config, group=None):
         raise ValueError("Two-level FP4 reference modules do not implement meta-device initialization")
 
 
-def _parameter(shape, config, init_method, *, is_expert=False, partition_dim=0, stride=1):
+def _parameter(
+    shape,
+    config,
+    init_method,
+    *,
+    is_expert=False,
+    partition_dim=0,
+    stride=1,
+    expert_slices=False,
+    cpu_master=True,
+    track_rng=True,
+):
     device = "cpu" if getattr(config, "use_cpu_initialization", False) else torch.cuda.current_device()
     parameter = torch.nn.Parameter(torch.empty(shape, dtype=config.params_dtype, device=device))
     parameter.allreduce = True  # TP1/EP1: expert DP and ordinary DP are the same group.
@@ -68,19 +79,30 @@ def _parameter(shape, config, init_method, *, is_expert=False, partition_dim=0, 
     parameter.partition_stride = stride
     if getattr(config, "perform_initialization", True):
         with torch.no_grad():
-            if parameter.device.type == "cpu":
-                master = torch.empty(shape, dtype=torch.float32, device="cpu")
-                init_method(master)
-                parameter.copy_(master)
-            else:
-                tracker = get_cuda_rng_tracker()
-                context = (
-                    tracker.fork(get_expert_parallel_rng_tracker_name())
-                    if is_expert and tracker.is_initialized()
-                    else tracker.fork() if tracker.is_initialized() else nullcontext()
-                )
-                with context:
-                    init_method(parameter)
+            # TE initializes each weight{i} separately, in params_dtype, with
+            # a separate expert RNG fork; Turbo only stacks them afterwards.
+            # A single normal_(whole_bank) changes launch/counter consumption.
+            # Views preserve TE's call shapes without a second complete bank.
+            for target in parameter.unbind(0) if expert_slices else (parameter,):
+                if getattr(config, "use_cpu_initialization", False) and cpu_master:
+                    master = torch.empty(target.shape, dtype=torch.float32, device="cpu")
+                    init_method(master)
+                    target.copy_(master)
+                else:
+                    tracker = (
+                        get_cuda_rng_tracker()
+                        if track_rng and not getattr(config, "use_cpu_initialization", False)
+                        else None
+                    )
+                    context = nullcontext()
+                    if tracker is not None and tracker.is_initialized():
+                        context = (
+                            tracker.fork(get_expert_parallel_rng_tracker_name())
+                            if is_expert
+                            else tracker.fork()
+                        )
+                    with context:
+                        init_method(target)
     return parameter
 
 
@@ -233,6 +255,7 @@ class TwoLevelFP4Linear(_FP4Module):
         self.tp_group = tp_group or parallel_state.get_tensor_model_parallel_group(check_initialized=False)
         self._tp_group, self.tp_size = self.tp_group, 1
         self.skip_bias_add, self.use_bias = skip_bias_add, bias
+        self._init_before_linear_parameters(input_size, config)
         partition_dim = 1 if parallel_mode == "row" else 0
         self.weight = _parameter(
             (output_size, input_size),
@@ -244,9 +267,14 @@ class TwoLevelFP4Linear(_FP4Module):
         )
         self.bias = None
         if bias:
-            self.bias = _parameter((output_size,), config, torch.nn.init.zeros_, partition_dim=0)
+            self.bias = _parameter(
+                (output_size,), config, torch.nn.init.zeros_, partition_dim=0, track_rng=False
+            )
             self.bias.tensor_model_parallel = parallel_mode != "row"
         self._init_fp4(config, name)
+
+    def _init_before_linear_parameters(self, input_size, config):
+        """Combined norm/linear subclasses register the constant norm first."""
 
     def forward(self, x, weight=None, runtime_gather_output=None):
         if weight is not None:
@@ -277,15 +305,20 @@ class TwoLevelFP4LayerNormColumnParallelLinear(TwoLevelFP4ColumnParallelLinear):
     ordinary linear here would remove the QKV/pre-MLP norm from the model.
     """
 
-    def __init__(self, input_size, output_size, *, config, **kwargs):
-        super().__init__(input_size, output_size, config=config, **kwargs)
+    def _init_before_linear_parameters(self, input_size, config):
         self.normalization = getattr(config, "normalization", "LayerNorm")
         if self.normalization not in ("LayerNorm", "RMSNorm"):
             raise ValueError(f"Unsupported reference normalization: {self.normalization}")
         self.layer_norm_epsilon = getattr(config, "layernorm_epsilon", 1e-5)
         self.zero_centered_gamma = getattr(config, "layernorm_zero_centered_gamma", False)
+        device = "cpu" if getattr(config, "use_cpu_initialization", False) else torch.cuda.current_device()
         self.layer_norm_weight = torch.nn.Parameter(
-            torch.full_like(self.weight[0], 0 if self.zero_centered_gamma else 1)
+            torch.full(
+                (input_size,),
+                0 if self.zero_centered_gamma else 1,
+                dtype=config.params_dtype,
+                device=device,
+            )
         )
         self.layer_norm_weight.allreduce = True
         self.layer_norm_weight.tensor_model_parallel = False
@@ -347,11 +380,20 @@ class TwoLevelFP4GroupedLinear(_FP4Module):
             init_method,
             is_expert=is_expert,
             partition_dim=2 if parallel_mode == "row" else 1,
+            expert_slices=True,
+            cpu_master=False,
         )
         self.bias = None
         if bias:
             self.bias = _parameter(
-                (num_gemms, output_size), config, torch.nn.init.zeros_, is_expert=is_expert, partition_dim=1
+                (num_gemms, output_size),
+                config,
+                torch.nn.init.zeros_,
+                is_expert=is_expert,
+                partition_dim=1,
+                expert_slices=True,
+                cpu_master=False,
+                track_rng=False,
             )
         self._init_fp4(config, name)
 

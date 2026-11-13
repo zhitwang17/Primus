@@ -107,9 +107,10 @@ class TwoLevelFP4Config:
 
     @property
     def rng_fingerprint(self):
-        """Kernel selection must not perturb a recipe's stochastic sequence."""
+        """Kernel/SR selection must not perturb the independent RHT stream."""
         numerical = self.to_dict()
         numerical.pop("quantizer")
+        numerical.pop("sr_rng", None)
         return hashlib.sha256(json.dumps(numerical, sort_keys=True).encode()).hexdigest()
 
     def operand(self, direction, role):

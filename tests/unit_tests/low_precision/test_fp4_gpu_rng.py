@@ -162,6 +162,23 @@ def test_gpu_rng_checkpoint_identity_and_mismatch_prevent_partial_restore():
         R.qdq(torch.ones(16, 16), cfg, cfg.operand("fwd", "weight"))
 
 
+def test_switching_sr_preserves_the_module_rht_stream_and_transform():
+    cpu = C.TwoLevelFP4Config("nvfp4", quantizer="triton")
+    gpu = C.TwoLevelFP4Config("nvfp4", quantizer="triton", sr_rng="triton_philox")
+    assert cpu.fingerprint != gpu.fingerprint
+    assert cpu.rng_fingerprint == gpu.rng_fingerprint
+    prefix = "rank0/model0/layer1/"
+    cpu_rng = C.FP4RandomState.for_config(cpu, prefix + cpu.rng_fingerprint)
+    gpu_rng = C.FP4RandomState.for_config(gpu, prefix + gpu.rng_fingerprint)
+    x = torch.arange(33 * 16, dtype=torch.float32).reshape(33, 16) / 512
+    y = torch.flip(x, dims=(0,))
+    for _ in range(3):
+        a, b = R.rht_pair(x, y, cpu, random=cpu_rng)
+        c, d = R.rht_pair(x, y, gpu, random=gpu_rng)
+        assert torch.equal(a, c) and torch.equal(b, d)
+        assert cpu_rng.rht_offset == gpu_rng.rht_offset
+
+
 def test_triton_interpreter_matches_oracle_quantization_and_resume():
     pytest.importorskip("triton")
     environment = dict(os.environ, TRITON_INTERPRET="1")

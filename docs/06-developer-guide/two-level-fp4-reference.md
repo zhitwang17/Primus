@@ -45,6 +45,25 @@ Quantized weight gradients return through ordinary autograd, so Megatron DDP
 accumulates `main_grad` and fires readiness hooks. This does not implement
 Turbo's direct fused FP32 wgrad accumulation/ownership optimization.
 
+Initialization follows the pinned TE/Turbo BF16 parameter protocol: each expert
+weight is initialized separately in its parameter dtype, under its own expert
+RNG tracker fork, before the next expert. The reference initializes views of a
+single bank rather than retaining both separate weights and a stacked copy.
+Dense CPU initialization retains Megatron's FP32 master-then-cast convention;
+grouped CPU initialization follows TE's direct parameter-dtype convention.
+Combined QKV norm parameters are registered before the linear weight, matching
+TE's parameter order. At TP=EP=ETP=1 the pinned MCore marks both native and
+reference expert weights `allreduce=True`; their DP grouping is consistent.
+
+The 2026-11-13 initialization correction changes fresh-run expert values and
+RNG progression relative to the former whole-bank initializer, even at the
+same seed. Continuation restores saved model/optimizer/RNG values and must
+not recreate them from initialization. Existing strict checkpoint rules still
+apply: a changed flat optimizer partition is rejected, with no implicit
+resharding or state migration. CPU tests pin native call shapes, dtypes,
+tracker boundaries, RNG state and norm parameter order; cross-recipe initial
+weight hashes on the actual GPU remain a separate qualification check.
+
 Forward input/weight quantization is deterministic. Backward reserves private
 streams for gradient SR and randomized H32 (H16/disabled are explicit options).
 Both wgrad operands receive the same transform. Recomputed forwards consume no
@@ -63,7 +82,8 @@ Four consecutive axis-last padded logical elements select the four output
 words; each word's high 24 bits multiplied by `2**-24` produces an exactly
 representable FP32 uniform in `[0,1)`. Changing the launch tile preserves the
 mapping. Reservations reject counter overflow before mutation. Paired RHT
-retains its small CPU reference stream. This is a distinct stochastic recipe,
+retains its small CPU reference stream, including the same stream key and
+bitwise transform when toggling only `fp4_sr_rng`. This is a distinct stochastic recipe,
 not bitwise parity with the CPU SR implementation or ALTO/Turbo.
 
 The default omits the new field from serialized contracts, preserving existing
@@ -109,7 +129,7 @@ Continuation records each module's names, parameter shape/dtype/trainability,
 base/train/eval routing and override flags, recipe fingerprints, SR/RHT offsets,
 Torch/RNG implementation, rank/world size and DeOsc history. Missing/mismatched
 state fails explicitly; `finetune` is an explicit fresh-state operation.
-The numerical RNG stream excludes the `fp4_quantizer` implementation choice,
+The numerical RNG stream name excludes `fp4_quantizer` and `fp4_sr_rng`,
 so Torch/Triton comparisons with `fp4_sr_rng: torch_cpu` do not change the random sequence. The complete
 checkpoint identity still includes that choice and rejects implementation
 switches on resume. Older checkpoints without the new quantizer identity also
