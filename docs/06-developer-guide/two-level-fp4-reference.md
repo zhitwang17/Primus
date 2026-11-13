@@ -317,6 +317,13 @@ The native checkpoint helper currently supports one PP1 model chunk and the
 same parallel topology on restore. It is a direct MCore checkpoint test, not
 a full Primus launcher/data-loader checkpoint lifecycle test.
 
+The helper explicitly selects `dp_reshardable` optimizer metadata on both
+save and load. Actual 2026-11-13 GPU smoke reached checkpoint saving and exposed
+that MCore's deprecated default `fully_sharded_model_space` still constructs
+`flattened_range` descriptors, which the pinned version's `ShardedTensor`
+rejects. The DP bucket layout preserves local FP32 masters and Adam states;
+FP4/DeOsc sidecars and strict complete-state replay checks remain mandatory.
+
 On 2026-11-10 the expanded profile passed NVFP4 Torch/Triton DP1, AMDFP4 Triton
 DP1, NVFP4 Triton DP2, and AMDFP4 Triton DP2 with full-layer recompute. All five
 runs reproduced steps3-4 and complete final model/master/moment/gradient/RNG/DeOsc

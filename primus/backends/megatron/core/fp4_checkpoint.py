@@ -25,9 +25,18 @@ def _state(models, optimizer, iteration, extra_state=None, *, is_loading=False):
     model = model_list[0]
     rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
     model_state = model.sharded_state_dict()
+    # Match the current training checkpoint path's DP bucket layout. MCore's
+    # deprecated default (fully_sharded_model_space) still constructs nonempty
+    # flattened_range descriptors, which current ShardedTensor rejects. The DP
+    # format saves local FP32 masters AND every Adam state tensor without that
+    # representation; loading must request the same layout. Replicated mixed-
+    # precision optimizers accept this metadata and use their ordinary layout.
+    optimizer_metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
     state = {
         "model": model_state,
-        "optimizer": optimizer.sharded_state_dict(model_state, is_loading=is_loading),
+        "optimizer": optimizer.sharded_state_dict(
+            model_state, is_loading=is_loading, metadata=optimizer_metadata
+        ),
         "iteration": int(iteration),
         "fp4_checkpoint_version": 1,
         "rank_state": ShardedObject("fp4_rank_state", extra_state, (world,), (rank,)),
