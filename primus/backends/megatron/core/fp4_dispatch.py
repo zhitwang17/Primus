@@ -30,6 +30,38 @@ def option(config, key, default=None, fallback=None):
     return default
 
 
+def comparison_rmsnorm_backend(config, fallback=None, environ=None):
+    """Explicit comparison-only QKV norm route; native preserves existing behavior."""
+    backend = option(config, "fp4_comparison_rmsnorm_backend", "native", fallback)
+    if backend not in ("native", "torch"):
+        raise ValueError("fp4_comparison_rmsnorm_backend must be native or torch")
+    if backend == "native":
+        return backend
+    recipe = _name(option(config, "fp4_recipe", fallback=fallback))
+    if not option(config, "fp4", None, fallback) or recipe not in ("mxfp4", "nvfp4", "amdfp4"):
+        raise ValueError("Comparison RMSNorm requires an explicit FP4 recipe")
+    if option(config, "normalization", None, fallback) != "RMSNorm":
+        raise ValueError("Comparison RMSNorm supports normalization=RMSNorm only")
+    if option(config, "transformer_impl", "transformer_engine", fallback) != "transformer_engine":
+        raise ValueError("Comparison RMSNorm requires transformer_impl=transformer_engine")
+    if recipe == "mxfp4":
+        if not all(
+            _boolean(option(config, key, False, fallback), key)
+            for key in ("enable_primus_turbo", "use_turbo_gemm")
+        ):
+            raise ValueError("Comparison MXFP4 RMSNorm requires the Turbo combined norm-linear route")
+    elif option(config, "fp4_backend", "auto", fallback) != "reference":
+        raise ValueError("Comparison two-level RMSNorm requires fp4_backend=reference")
+    for name in (
+        "PRIMUS_FUSED_RMSNORM_MXFP4_QKV",
+        "PRIMUS_FUSED_RESIDUAL_NORM",
+        "PRIMUS_FUSED_RESIDUAL_NORM_V2",
+    ):
+        if _boolean((environ or {}).get(name, "0"), name):
+            raise ValueError(f"{name} must be disabled for comparison RMSNorm")
+    return backend
+
+
 def is_two_level(config):
     return _name(option(config, "fp4_recipe")) in ("nvfp4", "amdfp4")
 
@@ -194,6 +226,7 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
 
 def validate_fp4_options(args, environ=None, require_runtime=True):
     """Called by argument validation and by the CPU preflight tool."""
+    comparison_rmsnorm_backend(args, environ=environ)
     if not option(args, "fp4"):
         if option(args, "fp4_backend", "auto") != "auto":
             raise ValueError("An explicit fp4_backend requires fp4 to be enabled")

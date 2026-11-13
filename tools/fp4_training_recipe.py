@@ -86,6 +86,7 @@ def build_recipe(
     supplemental_dp4_prefix=False,
     sr_rng="torch_cpu",
     value_checks="strict",
+    comparison_rmsnorm_backend="native",
 ):
     if recipe not in _RECIPES or type(steps) is not int or steps <= 0:
         raise ValueError("Expected mxfp4/nvfp4/amdfp4 and a positive optimizer-update limit")
@@ -95,6 +96,8 @@ def build_recipe(
         raise ValueError(
             "Supplemental DP4 prefix requires exactly 128 updates, full recompute, and no admission"
         )
+    if comparison_rmsnorm_backend not in ("native", "torch"):
+        raise ValueError("comparison_rmsnorm_backend must be native or torch")
     if sr_rng not in ("torch_cpu", "triton_philox"):
         raise ValueError("Expected sr_rng=torch_cpu or triton_philox")
     if value_checks not in ("strict", "grouped_deferred"):
@@ -198,6 +201,8 @@ def build_recipe(
         weight_deosc_epsilon=1e-12,
         weight_deosc_log_freq=1,
     )
+    if comparison_rmsnorm_backend != "native":
+        changes["fp4_comparison_rmsnorm_backend"] = comparison_rmsnorm_backend
     if recipe != "mxfp4":
         changes.update(
             fp4_backend="reference",
@@ -318,6 +323,10 @@ def build_recipe(
             deosc_activated_in_prefix=False,
             comparison_boundary="Supplemental DP4 128-update paired prefix with evaluation every 32 updates; before default DeOsc starts, not a DP8 or 3000-update comparison or convergence result",
         )
+    if comparison_rmsnorm_backend != "native":
+        manifest["rmsnorm_control"] = (
+            "torch FP32 arithmetic in both combined QKV RMSNorm slots; parameter dtype and zero-centered addition preserved"
+        )
     return result, manifest
 
 
@@ -337,6 +346,7 @@ def main():
     supplemental.add_argument("--supplemental-dp4-prefix", action="store_true")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
+    parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
     args = parser.parse_args()
     recipe, manifest = build_recipe(
         args.source_root,
@@ -351,6 +361,7 @@ def main():
         supplemental_dp4_prefix=args.supplemental_dp4_prefix,
         sr_rng=args.sr_rng,
         value_checks=args.value_checks,
+        comparison_rmsnorm_backend=args.comparison_rmsnorm_backend,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     recipe_path = args.output_dir / "recipe.yaml"

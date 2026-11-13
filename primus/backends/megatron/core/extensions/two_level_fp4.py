@@ -27,6 +27,7 @@ from primus.backends.megatron.core.fp4_autograd import grouped_linear, linear
 from primus.backends.megatron.core.fp4_contract import _name
 from primus.backends.megatron.core.fp4_dispatch import (
     build_two_level_config,
+    comparison_rmsnorm_backend,
     current_fp4_plan,
     module_fp4_context,
 )
@@ -306,6 +307,8 @@ class TwoLevelFP4LayerNormColumnParallelLinear(TwoLevelFP4ColumnParallelLinear):
     """
 
     def _init_before_linear_parameters(self, input_size, config):
+        self.fp4_comparison_rmsnorm_backend = comparison_rmsnorm_backend(_options(config))
+        self.fp4_comparison_rmsnorm_calls = 0
         self.normalization = getattr(config, "normalization", "LayerNorm")
         if self.normalization not in ("LayerNorm", "RMSNorm"):
             raise ValueError(f"Unsupported reference normalization: {self.normalization}")
@@ -331,10 +334,16 @@ class TwoLevelFP4LayerNormColumnParallelLinear(TwoLevelFP4ColumnParallelLinear):
     def forward(self, x, **kwargs):
         gamma = self.layer_norm_weight + 1 if self.zero_centered_gamma else self.layer_norm_weight
         if self.normalization == "RMSNorm":
-            normalized = x.float() * torch.rsqrt(
-                x.float().square().mean(-1, keepdim=True) + self.layer_norm_epsilon
-            )
-            normalized = (normalized * gamma.float()).to(x.dtype)
+            if self.fp4_comparison_rmsnorm_backend == "torch":
+                from primus.backends.megatron.core.fp4_norm import comparison_rmsnorm
+
+                normalized = comparison_rmsnorm(x, gamma, self.layer_norm_epsilon)
+                self.fp4_comparison_rmsnorm_calls += 1
+            else:
+                normalized = x.float() * torch.rsqrt(
+                    x.float().square().mean(-1, keepdim=True) + self.layer_norm_epsilon
+                )
+                normalized = (normalized * gamma.float()).to(x.dtype)
         else:
             normalized = F.layer_norm(
                 x.float(),

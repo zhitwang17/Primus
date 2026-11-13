@@ -1906,6 +1906,10 @@ class PrimusTurboLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         _apply_turbo_gemm_backend_env()
 
         args = get_args()
+        from primus.backends.megatron.core.fp4_dispatch import comparison_rmsnorm_backend
+
+        self.fp4_comparison_rmsnorm_backend = comparison_rmsnorm_backend(config, fallback=args)
+        self.fp4_comparison_rmsnorm_calls = 0
         self.offload = args.offload and "column_parallel_gemm" in args.offload_ops
         assert not self.offload, "gemm offload still have some problems"
 
@@ -1960,6 +1964,10 @@ class PrimusTurboLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
     def forward_internal(self, x, is_first_microbatch: bool = False):
         """Forward."""
         fused_mxfp4_payload = _take_fused_mxfp4_activation(x)
+        if self.fp4_comparison_rmsnorm_backend == "torch" and (
+            fused_mxfp4_payload is not None or getattr(self, "_skip_fused_norm", False)
+        ):
+            raise ValueError("Comparison RMSNorm cannot consume fused or already normalized input")
         if fused_mxfp4_payload is not None:
             assert getattr(
                 self, "_skip_fused_norm", False
@@ -1981,13 +1989,19 @@ class PrimusTurboLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                 x, [x.size(-1)], norm_weight, self.layer_norm_bias, self.eps
             )
         elif self.config.normalization == "RMSNorm":
-            from primus_turbo.pytorch.ops.normalization import rmsnorm
+            if self.fp4_comparison_rmsnorm_backend == "torch":
+                from primus.backends.megatron.core.fp4_norm import comparison_rmsnorm
 
-            if getattr(self, "_skip_fused_norm", False):
-                # x arrives normalized by fused_residual_rmsnorm, which applies the +1 itself
-                norm_out = x
+                norm_out = comparison_rmsnorm(x, norm_weight, self.eps)
+                self.fp4_comparison_rmsnorm_calls += 1
             else:
-                norm_out = rmsnorm(x, norm_weight, self.eps)
+                from primus_turbo.pytorch.ops.normalization import rmsnorm
+
+                if getattr(self, "_skip_fused_norm", False):
+                    # x arrives normalized by fused_residual_rmsnorm, which applies the +1 itself
+                    norm_out = x
+                else:
+                    norm_out = rmsnorm(x, norm_weight, self.eps)
         else:
             assert False, "Not support normalization type."
 
