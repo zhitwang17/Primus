@@ -69,6 +69,7 @@ def _source_fingerprints():
             for name in (
                 "fp4_contract",
                 "fp4_dispatch",
+                "fp4_norm",
                 "fp4_reference",
                 "fp4_backend",
                 "fp4_triton",
@@ -106,6 +107,7 @@ def parse_args(argv=None):
     parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
+    parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
     parser.add_argument("--checkpoint-format", choices=("bundle", "torch_dist"), default="bundle")
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--glu-clamp", type=float, default=None)
@@ -211,6 +213,7 @@ def _make_config(args):
     config.fp4_quantizer = args.quantizer
     config.fp4_sr_rng = args.sr_rng
     config.fp4_value_checks = args.value_checks
+    config.fp4_comparison_rmsnorm_backend = args.comparison_rmsnorm_backend
     config.use_distributed_optimizer = args.distributed_optimizer
     config.weight_deosc = args.deosc
     config.weight_deosc_accumulator_dtype = args.deosc_accumulator_dtype
@@ -218,6 +221,61 @@ def _make_config(args):
     config.use_turbo_gemm = False
     config.use_turbo_grouped_gemm = False
     return config
+
+
+def _rmsnorm_snapshot(model, backend, num_layers, *, executed=False, pristine=False):
+    """Read actual combined norm slots without touching tensor values or RNG."""
+    expected = {f"decoder.layers.{index}.self_attention.linear_qkv" for index in range(num_layers)}
+    parameters = dict(model.named_parameters())
+    slots = {}
+    for name, module in model.named_modules():
+        if not (
+            hasattr(module, "fp4_comparison_rmsnorm_backend")
+            or hasattr(module, "fp4_comparison_rmsnorm_calls")
+        ):
+            continue
+        selected = getattr(module, "fp4_comparison_rmsnorm_backend", None)
+        calls = getattr(module, "fp4_comparison_rmsnorm_calls", None)
+        if selected != backend or type(calls) is not int or calls < 0:
+            raise AssertionError(f"Invalid actual RMSNorm route/counter at {name}: {selected}, {calls}")
+        if pristine and calls != 0:
+            raise AssertionError(f"Fresh RMSNorm counter is not zero: {name}")
+        if executed and backend == "torch" and calls == 0:
+            raise AssertionError(f"Torch comparison RMSNorm did not execute: {name}")
+        parameter_name = name + ".layer_norm_weight"
+        gamma = getattr(module, "layer_norm_weight", None)
+        if gamma is None or parameters.get(parameter_name) is not gamma:
+            raise AssertionError(f"Combined RMSNorm parameter identity missing: {name}")
+        slots[name] = {
+            "class": type(module).__module__ + "." + type(module).__qualname__,
+            "backend": selected,
+            "calls": calls,
+            "parameter_name": parameter_name,
+            "parameter_shape": list(gamma.shape),
+            "parameter_dtype": str(gamma.dtype),
+        }
+    actual = {name for name in slots if name.endswith(".self_attention.linear_qkv")}
+    if actual != expected:
+        raise AssertionError(
+            f"Combined QKV RMSNorm slots differ: expected {sorted(expected)}, got {sorted(actual)}"
+        )
+    return {"backend": backend, "expected_qkv_slots": len(expected), "slots": slots}
+
+
+def _assert_rmsnorm_replay(original, replayed):
+    # Diagnostic call counts include activation recompute and intentionally do
+    # not enter model/FP4 state_dict. Fresh replay must execute the same routes.
+    def identities(snapshot):
+        return {
+            "backend": snapshot["backend"],
+            "expected_qkv_slots": snapshot["expected_qkv_slots"],
+            "slots": {
+                name: {key: value for key, value in slot.items() if key != "calls"}
+                for name, slot in snapshot["slots"].items()
+            },
+        }
+
+    _assert_equal(identities(original), identities(replayed), "rmsnorm_replay_routes")
 
 
 _CHECK_CHUNK_ELEMENTS = 4 * 1024 * 1024
@@ -774,6 +832,11 @@ def run(args, result):
             torch.cuda.reset_peak_memory_stats()
             model, ddp, optimizer, runners = _build_training_objects(args, config)
             model.train()
+            result["rmsnorm"] = {
+                "initial": _rmsnorm_snapshot(
+                    model, args.comparison_rmsnorm_backend, config.num_layers, pristine=True
+                )
+            }
             result["memory"] = {"initialization": _memory_summary()}
             result["initial_replica_check"] = _assert_replicated(
                 model.named_parameters(), "initial parameters"
@@ -856,6 +919,9 @@ def run(args, result):
                     _save_checkpoint(args, model, optimizer, checkpoint_directory, checkpoint_step)
                     after_save = _training_fingerprints(model, optimizer, include_gradients=False)
                     _assert_equal(result["checkpoint_saved_state_sha256"], after_save, "save_side_effects")
+            result["rmsnorm"]["original_execution"] = _rmsnorm_snapshot(
+                model, args.comparison_rmsnorm_backend, config.num_layers, executed=True
+            )
             result["memory"]["training_and_checkpoint"] = _memory_summary()
             result["execution_counts"] = execution_counts()
             for kind in ("dense", "grouped"):
@@ -880,6 +946,9 @@ def run(args, result):
             fresh_model, fresh_ddp, fresh_optimizer, fresh_runners = _build_training_objects(args, config)
             _load_checkpoint(args, fresh_model, fresh_optimizer, checkpoint_directory, checkpoint_step)
             fresh_model.train()
+            result["rmsnorm"]["restored_before_replay"] = _rmsnorm_snapshot(
+                fresh_model, args.comparison_rmsnorm_backend, config.num_layers, pristine=True
+            )
             restored_fingerprints = _training_fingerprints(
                 fresh_model, fresh_optimizer, include_gradients=False
             )
@@ -906,6 +975,12 @@ def run(args, result):
                 )
                 for step in range(checkpoint_step, args.steps)
             ]
+            result["rmsnorm"]["replayed_execution"] = _rmsnorm_snapshot(
+                fresh_model, args.comparison_rmsnorm_backend, config.num_layers, executed=True
+            )
+            _assert_rmsnorm_replay(
+                result["rmsnorm"]["original_execution"], result["rmsnorm"]["replayed_execution"]
+            )
             # Preserve evidence before asserting so failed replays can distinguish
             # missing checkpoint state from nondeterministic forward/backward ops.
             actual_fingerprints = _training_fingerprints(fresh_model, fresh_optimizer)
@@ -937,6 +1012,7 @@ def run(args, result):
                 "ddp_main_grad_exact": True,
                 "private_rng_and_deosc_exact": True,
                 "global_rng_exact": True,
+                "rmsnorm_routes_verified": True,
                 "scope": "Fresh model/DDP/optimizer; original training objects released before reconstruction",
             }
             result["status"] = "passed"
@@ -982,6 +1058,7 @@ def main():
         "quantizer": args.quantizer,
         "sr_rng": args.sr_rng,
         "value_checks": args.value_checks,
+        "comparison_rmsnorm_backend": args.comparison_rmsnorm_backend,
         "seed": args.seed,
         "model": {
             "implementation": "Megatron GPTModel",
