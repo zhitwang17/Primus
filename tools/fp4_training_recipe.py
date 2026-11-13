@@ -83,11 +83,14 @@ def build_recipe(
     recompute=True,
     admission=False,
     sr_rng="torch_cpu",
+    value_checks="strict",
 ):
     if recipe not in _RECIPES or type(steps) is not int or steps <= 0:
         raise ValueError("Expected mxfp4/nvfp4/amdfp4 and a positive optimizer-update limit")
     if sr_rng not in ("torch_cpu", "triton_philox"):
         raise ValueError("Expected sr_rng=torch_cpu or triton_philox")
+    if value_checks not in ("strict", "grouped_deferred"):
+        raise ValueError("Expected value_checks=strict or grouped_deferred")
     source_root = Path(source_root)
     base = (
         source_root / "examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-MXFP4-deosc-mlperf-pretrain.yaml"
@@ -193,6 +196,7 @@ def build_recipe(
             fp4_gradient_sr=True,
             fp4_rng_seed=seed,
             fp4_sr_rng=sr_rng,
+            fp4_value_checks=value_checks,
             fp4_param=False,
             fp4_param_gather=False,
             use_turbo_gemm=False,
@@ -238,6 +242,7 @@ def build_recipe(
         ),
         "recompute": recompute,
         "fp4_sr_rng": sr_rng if recipe != "mxfp4" else None,
+        "fp4_value_checks": value_checks if recipe != "mxfp4" else None,
         "environment_overrides": {
             key: {"before": source_environment.get(key), "after": environment.get(key)}
             for key in sorted(source_environment.keys() | environment.keys())
@@ -260,6 +265,7 @@ def main():
     parser.add_argument("--recompute", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--admission", action="store_true")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
+    parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     args = parser.parse_args()
     recipe, manifest = build_recipe(
         args.source_root,
@@ -271,6 +277,7 @@ def main():
         recompute=args.recompute,
         admission=args.admission,
         sr_rng=args.sr_rng,
+        value_checks=args.value_checks,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     recipe_path = args.output_dir / "recipe.yaml"

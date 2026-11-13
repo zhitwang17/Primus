@@ -20,5 +20,7 @@ def qdq(x, config, operand, **kwargs):
     return quantizer(config).qdq(x, config, operand, **kwargs)
 
 
-def compute_outer_scale(x, config):
+def compute_outer_scale(x, config, *, validation=None):
+    if validation is not None:
+        return quantizer(config).compute_outer_scale(x, config, validation=validation)
     return quantizer(config).compute_outer_scale(x, config)

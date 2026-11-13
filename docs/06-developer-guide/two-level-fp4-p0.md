@@ -31,6 +31,7 @@ Primus type; it is never passed to Turbo's block32/E8M0 `Float4QuantConfig`.
 | Module override | Turbo's existing per-module boundary consults the new selector; override flags and nested BF16 metadata scopes are respected |
 | Tensor payload | `TwoLevelFP4Tensor`: packed data, inner scale, required outer scale, config and layout together; shape/dtype/device/contiguity validation and metadata round-trip |
 | Randomness | `FP4RandomState`: private SR/RHT block reservations, deterministic domain-separated numeric keys, stable caller-supplied rank/module `stream_id`, checkpoint identity checks; default CPU SR or explicit Triton Philox SR |
+| Value validation | Default strict public checks; explicit Triton `fp4_value_checks: grouped_deferred` accumulates three device error flags and raises before each grouped autograd call returns, with unchanged finite-input arithmetic and RNG streams |
 | Launcher | Explicit `PRIMUS_LINEAR_PRECISION`; no filename-based precision inference; preserve explicit LR/warmup; propagate config-export failures before launching |
 
 `auto` retains the existing MXFP4 path. For NVFP4 it can delegate to TE if no

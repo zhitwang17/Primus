@@ -73,6 +73,26 @@ random tensors to the device; it is not ALTO/Turbo Philox stream parity. Exact
 continuation requires the same Torch version. Value checks and routed lengths
 may synchronize the GPU: this backend favors inspectable correctness.
 
+`fp4_value_checks` defaults to `strict`. Explicit `grouped_deferred` requires
+the Triton quantizer and changes only grouped forward/backward validation:
+each call owns three sticky device integers for nonfinite inputs, invalid
+outer scales and invalid combined scales. Quantization and RHT input checks
+still execute; their errors are transferred together and raised before that
+autograd function returns. No errors are deferred across optimizer updates,
+and no grad scaler is required. Dense/DeOsc and direct public QDQ/quantize
+calls retain immediate checks. Each scope retains only 12 bytes of status,
+not per-expert tensors. This mode does not change finite-input arithmetic,
+SR/RHT keys or reservation order; its explicit checkpoint identity differs,
+while the default serialization/fingerprint is unchanged. Error reporting
+moves to the end of that grouped call, so failed calls may consume more RNG
+before aborting. Restart from a valid checkpoint rather than continuing after
+an exception. CPU/interpreter and offline gfx950 compilation validate the
+implementation; GPU timing and qualification remain pending.
+
+The deterministic CPU Walsh base is cached for H16/H32. Each transform still
+generates its own random signs and permutation in the original order; random
+matrices are not cached, and no persistent GPU H-matrix cache is introduced.
+
 For `fp4_quantizer: triton`, explicit `fp4_sr_rng: triton_philox` generates SR
 uniforms directly inside the quantization kernel. It allocates neither a CPU
 random tensor nor a device uniform buffer. The versioned mapping

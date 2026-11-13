@@ -47,6 +47,15 @@ def test_profile_defaults_and_backward_compatible_tiny():
     assert full.checkpoint_format == "bundle"
 
 
+def test_grouped_deferred_validation_is_opt_in_and_requires_triton():
+    base = ["--recipe", "nvfp4", "--output", "/tmp/result.json"]
+    assert SMOKE.parse_args(base).value_checks == "strict"
+    with pytest.raises(SystemExit):
+        SMOKE.parse_args(base + ["--value-checks", "grouped_deferred"])
+    options = SMOKE.parse_args(base + ["--quantizer", "triton", "--value-checks", "grouped_deferred"])
+    assert options.value_checks == "grouped_deferred"
+
+
 @pytest.mark.parametrize("extra", [["--batch-size", "0"], ["--vocab-size", "9"], ["--lr", "0"]])
 def test_invalid_scale_options_rejected(extra):
     with pytest.raises(SystemExit):

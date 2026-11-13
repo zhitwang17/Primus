@@ -84,6 +84,32 @@ def _amax_reduce(X, OUT, N: tl.constexpr, FINAL: tl.constexpr, DENOM: tl.constex
 
 
 @triton.jit
+def _validate_input_kernel(
+    X,
+    ERROR,
+    N: tl.constexpr,
+    R: tl.constexpr,
+    C: tl.constexpr,
+    SB: tl.constexpr,
+    SR: tl.constexpr,
+    SC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(X + _input_offsets(idx, R, C, SB, SR, SC), idx < N, 0).to(tl.float32)
+    bad = tl.sum(((idx < N) & ~(tl.abs(value) < float("inf"))).to(tl.int32), 0)
+    if bad:
+        tl.atomic_or(ERROR, 1)
+
+
+@triton.jit
+def _validate_outer_kernel(OUTER, ERROR):
+    outer = tl.load(OUTER)
+    if ~((outer > 0.0) & (outer < float("inf"))):
+        tl.atomic_or(ERROR + 1, 1)
+
+
+@triton.jit
 def _inner_round(x, MIN_NORMAL: tl.constexpr, SUBNORMAL_INV: tl.constexpr):
     """Positive finite 3-mantissa-bit RNE, including AMD subnormal scales."""
     bits = x.to(tl.uint32, bitcast=True)
@@ -175,6 +201,7 @@ def _quantize_kernel(
     INNER_MAX: tl.constexpr,
     MIN_NORMAL: tl.constexpr,
     SUBNORMAL_INV: tl.constexpr,
+    DEFERRED: tl.constexpr = False,
 ):
     ct = CP // 16
     rt = tl.cdiv(RP, 16)
@@ -189,10 +216,21 @@ def _quantize_kernel(
         (rows[:, None] < R) & (cols[None, :] < C),
         0.0,
     ).to(tl.float32)
+    if DEFERRED:
+        # A finite amax/scale alone cannot establish finite input: the amax
+        # reduction intentionally excludes nonfinite values. Keep this check
+        # inside the data-reading kernel, including when OUTER was supplied.
+        valid = (rows[:, None] < R) & (cols[None, :] < C)
+        bad_input = tl.sum(tl.sum((valid & ~(tl.abs(value) < float("inf"))).to(tl.int32), 1), 0)
+        if bad_input:
+            tl.atomic_or(ERROR, 1)
     maximum = tl.max(tl.abs(value), 1)
     if TWO_D:
         maximum = tl.max(maximum, 0)
     outer = tl.load(OUTER)
+    if DEFERRED:
+        if ~((outer > 0.0) & (outer < float("inf"))):
+            tl.atomic_or(ERROR + 1, 1)
     raw_inner = tl.div_rn(maximum, outer) * (1.0 / 6.0)
     raw_inner = tl.minimum(tl.maximum(raw_inner, INNER_FLOOR), INNER_MAX)
     inner = _inner_round(raw_inner, MIN_NORMAL, SUBNORMAL_INV)
@@ -204,7 +242,7 @@ def _quantize_kernel(
         else:
             bad = tl.sum(((rows < RP) & invalid).to(tl.int32), 0)
         if bad:
-            tl.atomic_or(ERROR, 1)
+            tl.atomic_or(ERROR + (2 if DEFERRED else 0), 1)
     if not TWO_D:
         combined = combined[:, None]
     scaled = tl.div_rn(value, combined)
@@ -300,16 +338,86 @@ def _shape_stride(x, axis=None):
     return shape, strides
 
 
+class DeferredValueChecks:
+    """Bounded checks for ONE grouped forward or backward call.
+
+    The three sticky device flags are input, outer-scale and combined-scale
+    errors. No tensor values or per-expert lists are retained. A normal context
+    exit transfers these three integers once and raises before autograd returns.
+    Explicit objects avoid global state, cross-step deferral and nested-scope
+    interference. Ordinary public QDQ calls do not use this object implicitly.
+    """
+
+    def __init__(self, device):
+        self.flags = torch.zeros(3, dtype=torch.int32, device=device)
+        self.closed = False
+
+    def _require_open(self, x):
+        if self.closed:
+            raise RuntimeError("FP4 deferred validation scope is already closed")
+        if x.device != self.flags.device:
+            raise ValueError("FP4 deferred validation cannot cross devices")
+
+    def check_input(self, x):
+        self._require_open(x)
+        _input(x)
+        if x.numel():
+            (_, r, c), strides = _shape_stride(x)
+            _validate_input_kernel[(triton.cdiv(x.numel(), 4096),)](
+                x, self.flags, x.numel(), r, c, *strides, 4096
+            )
+
+    def finish(self):
+        if self.closed:
+            raise RuntimeError("FP4 deferred validation scope is already closed")
+        self.closed = True
+        flags = self.flags.cpu().tolist()
+        failures = [
+            description
+            for flag, description in zip(
+                flags, ("non-finite input", "invalid outer scale", "invalid combined inner/outer scale")
+            )
+            if flag
+        ]
+        if failures:
+            raise ValueError("FP4 grouped deferred validation: " + "; ".join(failures))
+
+    def __enter__(self):
+        self._require_open(self.flags)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.finish()
+        else:
+            # Preserve the original failure; this object is never reused.
+            self.closed = True
+        return False
+
+
+def _validation_flags(validation, x, check_values):
+    if not isinstance(validation, DeferredValueChecks):
+        raise TypeError("FP4 validation requires a DeferredValueChecks scope")
+    if not check_values:
+        raise ValueError("Deferred FP4 validation cannot disable value checks")
+    validation._require_open(x)
+    return validation.flags
+
+
 @torch.no_grad()
-def compute_outer_scale(x, config, *, check_values=True):
+def compute_outer_scale(x, config, *, check_values=True, validation=None):
     """Whole-tensor outer amax with bounded-size recursive Triton reductions."""
     _input(x)
+    error = (
+        _validation_flags(validation, x, check_values)
+        if validation is not None
+        else torch.zeros(1, device=x.device, dtype=torch.int32)
+    )
     if not x.numel():
         return torch.full((1,), 1e-30, device=x.device, dtype=torch.float32)
     (_, r, c), (sb, sr, sc) = _shape_stride(x)
     count = triton.cdiv(x.numel(), 4096)
     partial = torch.empty(count, device=x.device, dtype=torch.float32)
-    error = torch.zeros(1, device=x.device, dtype=torch.int32)
     _amax_input[(count,)](x, partial, error, x.numel(), r, c, sb, sr, sc, check_values, 4096)
     while count > 4096:
         next_count = triton.cdiv(count, 4096)
@@ -318,19 +426,21 @@ def compute_outer_scale(x, config, *, check_values=True):
         partial, count = reduced, next_count
     outer = torch.empty(1, device=x.device, dtype=torch.float32)
     _amax_reduce[(1,)](partial, outer, count, True, 6.0 * config.inner_max, triton.next_power_of_2(count))
-    if check_values and error.item():
+    if validation is None and check_values and error.item():
         raise ValueError("Triton FP4 rejects non-finite input")
     return outer
 
 
-def _prepare(x, config, operand, outer_scale, random, check_values):
+def _prepare(x, config, operand, outer_scale, random, check_values, validation=None):
     _input(x)
+    if validation is not None:
+        _validation_flags(validation, x, check_values)
     if operand != config.operand(operand.direction, operand.role):
         raise ValueError("FP4 operand does not match its recipe")
     if operand.stochastic_rounding:
         _check_random(random, config)
     if outer_scale is None:
-        outer_scale = compute_outer_scale(x, config, check_values=check_values)
+        outer_scale = compute_outer_scale(x, config, check_values=check_values, validation=validation)
     else:
         if (
             not isinstance(outer_scale, torch.Tensor)
@@ -339,12 +449,16 @@ def _prepare(x, config, operand, outer_scale, random, check_values):
             or outer_scale.shape != (1,)
         ):
             raise ValueError("outer_scale must be FP32 [1] on the input device")
-        if check_values:
+        if check_values and validation is None:
             if not bool(torch.isfinite(x).all()):
                 raise ValueError("Triton FP4 rejects non-finite input")
             if not bool((torch.isfinite(outer_scale) & (outer_scale > 0)).all()):
                 raise ValueError("outer_scale must be positive and finite")
     outer = outer_scale.detach().clone().contiguous()
+    if validation is not None and not x.numel():
+        # Empty QDQ has no data kernel, but its explicit outer must still be
+        # valid. Do not silently drop an invalid scale on an empty expert.
+        _validate_outer_kernel[(1,)](outer, validation.flags)
     axis = operand.axis % x.ndim
     physical, strides = _shape_stride(x, axis)
     b, r, c = physical
@@ -372,14 +486,31 @@ def _prepare(x, config, operand, outer_scale, random, check_values):
 
 
 def _launch(
-    x, config, operand, outer, physical, padded, strides, uniform, packed, inner, out, direct, check_values
+    x,
+    config,
+    operand,
+    outer,
+    physical,
+    padded,
+    strides,
+    uniform,
+    packed,
+    inner,
+    out,
+    direct,
+    check_values,
+    validation=None,
 ):
     b, r, c = physical
     _, rp, cp = padded
     if not b * rp * cp:
         return
     _, out_strides = _shape_stride(out, operand.axis % out.ndim) if direct else ((0, 0, 0), (0, 0, 0))
-    error = torch.zeros(1, dtype=torch.int32, device=x.device) if check_values else outer
+    error = (
+        validation.flags
+        if validation is not None
+        else torch.zeros(1, dtype=torch.int32, device=x.device) if check_values else outer
+    )
     gpu_random = config.sr_rng == "triton_philox" and operand.stochastic_rounding
     seed, offset = (uniform["seed"], uniform["offset"]) if gpu_random else (0, 0)
     _quantize_kernel[(b * triton.cdiv(rp, 16) * (cp // 16),)](
@@ -407,23 +538,37 @@ def _launch(
         config.inner_max,
         2.0 ** (-6 if config.recipe == "nvfp4" else -14),
         2.0 ** (9 if config.recipe == "nvfp4" else 17),
+        validation is not None,
         num_warps=4,
         enable_fp_fusion=False,
     )
-    if check_values and error.item():
+    if validation is None and check_values and error.item():
         raise ValueError("FP4 combined inner/outer scale must be positive and finite in FP32")
 
 
 @torch.no_grad()
-def quantize(x, config, operand, *, outer_scale=None, random=None, check_values=True):
+def quantize(x, config, operand, *, outer_scale=None, random=None, check_values=True, validation=None):
     outer, layout, physical, padded, strides, uniform = _prepare(
-        x, config, operand, outer_scale, random, check_values
+        x, config, operand, outer_scale, random, check_values, validation
     )
     packed_shape, scale_shape = layout.storage_shapes(config)
     data = torch.empty(packed_shape, dtype=torch.uint8, device=x.device)
     inner = torch.empty(scale_shape, dtype=torch.float32, device=x.device)
     _launch(
-        x, config, operand, outer, physical, padded, strides, uniform, data, inner, outer, False, check_values
+        x,
+        config,
+        operand,
+        outer,
+        physical,
+        padded,
+        strides,
+        uniform,
+        data,
+        inner,
+        outer,
+        False,
+        check_values,
+        validation,
     )
     return TwoLevelFP4Tensor(data, inner, outer, config, layout).validate()
 
@@ -460,16 +605,29 @@ def dequantize(tensor, dtype=None):
 
 
 @torch.no_grad()
-def qdq(x, config, operand, *, outer_scale=None, random=None, dtype=None, check_values=True):
+def qdq(x, config, operand, *, outer_scale=None, random=None, dtype=None, check_values=True, validation=None):
     """Fused new-format quant/dequant with no packed or inner tensor writeback."""
     dtype = x.dtype if dtype is None else dtype
     if dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("Triton FP4 QDQ supports float32 or bfloat16")
     outer, layout, physical, padded, strides, uniform = _prepare(
-        x, config, operand, outer_scale, random, check_values
+        x, config, operand, outer_scale, random, check_values, validation
     )
     out = torch.empty(layout.original_shape, dtype=dtype, device=x.device)
     _launch(
-        x, config, operand, outer, physical, padded, strides, uniform, outer, outer, out, True, check_values
+        x,
+        config,
+        operand,
+        outer,
+        physical,
+        padded,
+        strides,
+        uniform,
+        outer,
+        outer,
+        out,
+        True,
+        check_values,
+        validation,
     )
     return out

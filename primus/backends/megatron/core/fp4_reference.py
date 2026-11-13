@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -30,12 +31,14 @@ _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _DTYPES = (torch.float32, torch.bfloat16)
 
 
-def _check_input(x):
+def _check_input(x, validation=None):
     if not isinstance(x, torch.Tensor) or x.dtype not in _DTYPES:
         raise ValueError("FP4 reference input must be a float32 or bfloat16 tensor")
     if x.device.type not in ("cpu", "cuda"):
         raise ValueError("FP4 reference requires a real CPU/CUDA/ROCm tensor")
-    if not bool(torch.isfinite(x).all()):
+    if validation is not None:
+        validation.check_input(x)
+    elif not bool(torch.isfinite(x).all()):
         raise ValueError("FP4 reference rejects non-finite input")
 
 
@@ -215,8 +218,19 @@ def qdq(x, config, operand, *, outer_scale=None, random=None, dtype=None):
     )
 
 
+@lru_cache(maxsize=2)
+def _rht_base(size):
+    """Immutable CPU Walsh base; random signs/permutations are never cached."""
+    index = torch.arange(size, dtype=torch.int64, device="cpu")
+    bits = index[:, None] & index[None, :]
+    parity = torch.zeros((size, size), dtype=torch.int64, device="cpu")
+    for shift in range(size.bit_length() - 1):
+        parity ^= (bits >> shift) & 1
+    return (1 - 2 * parity).float()
+
+
 @torch.no_grad()
-def rht_pair(x, dy, config, *, random=None):
+def rht_pair(x, dy, config, *, random=None, validation=None):
     """Apply the SAME orthogonal block transform on both wgrad token axes.
 
     Returns full padded rows: cropping a transformed tail before the wgrad
@@ -226,8 +240,8 @@ def rht_pair(x, dy, config, *, random=None):
     Randomized H uses row signs and a shared row/column permutation, freshly
     selected for this pair. Empty input and disabled RHT consume no RNG.
     """
-    _check_input(x)
-    _check_input(dy)
+    _check_input(x, validation)
+    _check_input(dy, validation)
     if x.ndim != 2 or dy.ndim != 2 or x.shape[0] != dy.shape[0] or x.device != dy.device:
         raise ValueError("RHT requires two 2-D operands with equal token count and device")
     if config.rht_size == 0 or x.shape[0] == 0:
@@ -235,13 +249,9 @@ def rht_pair(x, dy, config, *, random=None):
     size = config.rht_size
     if config.rht_randomized:
         _check_random(random, config)
-    # Walsh entries H[i,j] = (-1)**popcount(i & j); independently constructed.
-    index = torch.arange(size, dtype=torch.int64)
-    bits = index[:, None] & index[None, :]
-    parity = torch.zeros((size, size), dtype=torch.int64)
-    for shift in range(size.bit_length() - 1):
-        parity ^= (bits >> shift) & 1
-    h = (1 - 2 * parity).float()
+    # Walsh entries H[i,j] = (-1)**popcount(i & j). All following operations
+    # are out-of-place, so the cached deterministic base is never mutated.
+    h = _rht_base(size)
     if config.rht_randomized:
         generator = _generator(random, "rht", 2 * size)
         signs = 2 * torch.randint(2, (size,), generator=generator, dtype=torch.int64) - 1

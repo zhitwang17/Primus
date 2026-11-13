@@ -56,6 +56,7 @@ class TwoLevelFP4Config:
     quantizer: str = "torch"
     version: int = 1
     sr_rng: str = "torch_cpu"
+    value_checks: str = "strict"
 
     def __post_init__(self):
         object.__setattr__(self, "recipe", _name(self.recipe))
@@ -67,6 +68,10 @@ class TwoLevelFP4Config:
             raise ValueError("FP4 sr_rng must be torch_cpu or triton_philox")
         if self.sr_rng == "triton_philox" and self.quantizer != "triton":
             raise ValueError("FP4 sr_rng=triton_philox requires quantizer=triton")
+        if self.value_checks not in ("strict", "grouped_deferred"):
+            raise ValueError("FP4 value_checks must be strict or grouped_deferred")
+        if self.value_checks == "grouped_deferred" and self.quantizer != "triton":
+            raise ValueError("FP4 value_checks=grouped_deferred requires quantizer=triton")
         for key in ("weight_2d", "rht_randomized", "gradient_sr"):
             object.__setattr__(self, key, _boolean(getattr(self, key), key))
         if self.block_size != 16 or isinstance(self.block_size, bool):
@@ -99,6 +104,8 @@ class TwoLevelFP4Config:
         # Preserve that exact identity, bitstream and checkpoint compatibility.
         if self.sr_rng == "torch_cpu":
             values.pop("sr_rng")
+        if self.value_checks == "strict":
+            values.pop("value_checks")
         return values
 
     @property
@@ -111,6 +118,7 @@ class TwoLevelFP4Config:
         numerical = self.to_dict()
         numerical.pop("quantizer")
         numerical.pop("sr_rng", None)
+        numerical.pop("value_checks", None)
         return hashlib.sha256(json.dumps(numerical, sort_keys=True).encode()).hexdigest()
 
     def operand(self, direction, role):

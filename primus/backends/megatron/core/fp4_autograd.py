@@ -12,6 +12,7 @@ There is no persistent quantized-weight cache to invalidate after optimizer step
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -43,8 +44,19 @@ def _check_random(config, random):
         raise ValueError("FP4 RNG recipe does not match GEMM config")
 
 
-def _q(x, config, direction, role, random, outer=None):
-    return qdq(x, config, config.operand(direction, role), outer_scale=outer, random=random, dtype=x.dtype)
+def _q(x, config, direction, role, random, outer=None, validation=None):
+    kwargs = {"validation": validation} if validation is not None else {}
+    return qdq(
+        x, config, config.operand(direction, role), outer_scale=outer, random=random, dtype=x.dtype, **kwargs
+    )
+
+
+def _grouped_checks(x, config):
+    if config.value_checks == "grouped_deferred":
+        from .fp4_triton import DeferredValueChecks
+
+        return DeferredValueChecks(x.device)
+    return nullcontext(None)
 
 
 class _Linear(torch.autograd.Function):
@@ -110,56 +122,66 @@ class _GroupedLinear(torch.autograd.Function):
             raise ValueError("FP4 grouped linear expects [M,K] input and [E,N,K] weights")
         lengths, offsets, padded = _lengths(lengths, x.shape[0], weights.shape[0])
         _check_random(config, random)
-        ctx.save_for_backward(x, weights)
-        ctx.config, ctx.random, ctx.lengths = config, random, lengths
-        ctx.group_offsets, ctx.padded_offsets = offsets, padded
-        # All local experts share the bank's outer scale. Per-expert quantization
-        # must not accidentally replace that statistic with a local maximum.
-        outer_x = compute_outer_scale(x, config)
-        wq = _q(weights, config, "fwd", "weight", random)
-        parts = []
-        for i, (xp, n) in enumerate(zip(_split_pad(x, lengths), lengths)):
-            if n:
-                xq = _q(xp, config, "fwd", "input", random, outer_x)
-                parts.append((xq @ wq[i].t())[:n])
-            else:
-                parts.append(x.new_empty((0, weights.shape[1])))
-        _record(config, "grouped", "fwd")
-        return torch.cat(parts, dim=0)
+        with _grouped_checks(x, config) as validation:
+            ctx.save_for_backward(x, weights)
+            ctx.config, ctx.random, ctx.lengths = config, random, lengths
+            ctx.group_offsets, ctx.padded_offsets = offsets, padded
+            # All local experts share the bank's outer scale. Per-expert quantization
+            # must not accidentally replace that statistic with a local maximum.
+            outer_x = compute_outer_scale(x, config, validation=validation)
+            wq = _q(weights, config, "fwd", "weight", random, validation=validation)
+            parts = []
+            for i, (xp, n) in enumerate(zip(_split_pad(x, lengths), lengths)):
+                if n:
+                    xq = _q(xp, config, "fwd", "input", random, outer_x, validation)
+                    parts.append((xq @ wq[i].t())[:n])
+                else:
+                    parts.append(x.new_empty((0, weights.shape[1])))
+            _record(config, "grouped", "fwd")
+            # Context exit flushes errors BEFORE this result reaches autograd.
+            return torch.cat(parts, dim=0)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, weights = ctx.saved_tensors
         config, random, lengths = ctx.config, ctx.random, ctx.lengths
-        dy = grad_output.contiguous()
-        xp, dyp = _split_pad(x, lengths), _split_pad(dy, lengths)
-        dx = dw = None
-        if ctx.needs_input_grad[0]:
-            outer_dy = compute_outer_scale(dy, config)
-            wq = _q(weights, config, "dgrad", "weight", random)
-            parts = []
-            for i, (part, n) in enumerate(zip(dyp, lengths)):
-                if n:
-                    dyq = _q(part, config, "dgrad", "grad_output", random, outer_dy)
-                    parts.append((dyq @ wq[i])[:n])
-                else:
-                    parts.append(x.new_empty((0, x.shape[1])))
-            dx = torch.cat(parts, dim=0)
-            _record(config, "grouped", "dgrad")
-        if ctx.needs_input_grad[1]:
-            transformed = [rht_pair(a, b, config, random=random) for a, b in zip(xp, dyp)]
-            # wgrad's outer scope is the full transformed routed buffer. RHT is
-            # independently padded per expert and shared by both operands.
-            outer_x = compute_outer_scale(torch.cat([a for a, _ in transformed]), config)
-            outer_dy = compute_outer_scale(torch.cat([b for _, b in transformed]), config)
-            dw = torch.zeros_like(weights)
-            for i, ((a, b), n) in enumerate(zip(transformed, lengths)):
-                if n:
-                    aq = _q(a, config, "wgrad", "input", random, outer_x)
-                    bq = _q(b, config, "wgrad", "grad_output", random, outer_dy)
-                    dw[i] = bq.t() @ aq
-            _record(config, "grouped", "wgrad")
-        return dx, dw, None, None, None
+        with _grouped_checks(x, config) as validation:
+            dy = grad_output.contiguous()
+            xp, dyp = _split_pad(x, lengths), _split_pad(dy, lengths)
+            dx = dw = None
+            if ctx.needs_input_grad[0]:
+                outer_dy = compute_outer_scale(dy, config, validation=validation)
+                wq = _q(weights, config, "dgrad", "weight", random, validation=validation)
+                parts = []
+                for i, (part, n) in enumerate(zip(dyp, lengths)):
+                    if n:
+                        dyq = _q(part, config, "dgrad", "grad_output", random, outer_dy, validation)
+                        parts.append((dyq @ wq[i])[:n])
+                    else:
+                        parts.append(x.new_empty((0, x.shape[1])))
+                dx = torch.cat(parts, dim=0)
+                _record(config, "grouped", "dgrad")
+            if ctx.needs_input_grad[1]:
+                transformed = [
+                    rht_pair(a, b, config, random=random, validation=validation) for a, b in zip(xp, dyp)
+                ]
+                # wgrad's outer scope is the full transformed routed buffer. RHT is
+                # independently padded per expert and shared by both operands.
+                outer_x = compute_outer_scale(
+                    torch.cat([a for a, _ in transformed]), config, validation=validation
+                )
+                outer_dy = compute_outer_scale(
+                    torch.cat([b for _, b in transformed]), config, validation=validation
+                )
+                dw = torch.zeros_like(weights)
+                for i, ((a, b), n) in enumerate(zip(transformed, lengths)):
+                    if n:
+                        aq = _q(a, config, "wgrad", "input", random, outer_x, validation)
+                        bq = _q(b, config, "wgrad", "grad_output", random, outer_dy, validation)
+                        dw[i] = bq.t() @ aq
+                _record(config, "grouped", "wgrad")
+            # No invalid dx/dw can reach a parameter's accumulation/DDP hook.
+            return dx, dw, None, None, None
 
 
 def grouped_linear(x, weights, lengths, config, random=None):

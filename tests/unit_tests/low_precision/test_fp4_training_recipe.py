@@ -205,6 +205,21 @@ def test_gpu_rng_is_explicit_and_does_not_claim_an_mxfp4_rng_change():
         _build("nvfp4", sr_rng="typo")
 
 
+def test_grouped_value_checks_are_explicit_and_do_not_change_mxfp4():
+    for recipe in ("nvfp4", "amdfp4"):
+        _, strict, default_manifest = _build(recipe)
+        _, deferred, manifest = _build(recipe, value_checks="grouped_deferred")
+        assert strict["fp4_value_checks"] == default_manifest["fp4_value_checks"] == "strict"
+        assert deferred["fp4_value_checks"] == manifest["fp4_value_checks"] == "grouped_deferred"
+        assert {k: v for k, v in strict.items() if k != "fp4_value_checks"} == {
+            k: v for k, v in deferred.items() if k != "fp4_value_checks"
+        }
+    _, args, manifest = _build("mxfp4", value_checks="grouped_deferred")
+    assert "fp4_value_checks" not in args and manifest["fp4_value_checks"] is None
+    with pytest.raises(ValueError, match="value_checks"):
+        _build("nvfp4", value_checks="unchecked")
+
+
 @pytest.mark.parametrize("steps", [0, -1, 1_200_000])
 def test_invalid_bounded_horizon_rejected(steps):
     with pytest.raises(ValueError):
@@ -228,6 +243,8 @@ def test_cli_artifacts_replay_exact_rendered_recipe_and_provenance(tmp_path):
             "/task/tokenizer",
             "--sr-rng",
             "triton_philox",
+            "--value-checks",
+            "grouped_deferred",
         ],
         check=True,
         capture_output=True,
@@ -251,5 +268,6 @@ def test_cli_artifacts_replay_exact_rendered_recipe_and_provenance(tmp_path):
     assert args["tokenizer_model"] == "/task/tokenizer"
     assert args["seed"] == args["fp4_rng_seed"] == 2026
     assert args["fp4_sr_rng"] == manifest["fp4_sr_rng"] == "triton_philox"
+    assert args["fp4_value_checks"] == manifest["fp4_value_checks"] == "grouped_deferred"
     assert manifest["changed_overrides"]["exit_interval"]["after"] == args["exit_interval"]
     assert manifest["changed_overrides"]["weight_deosc_fusion"] == {"before": True, "after": False}

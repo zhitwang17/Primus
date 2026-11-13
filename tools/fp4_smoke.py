@@ -105,6 +105,7 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
+    parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     parser.add_argument("--checkpoint-format", choices=("bundle", "torch_dist"), default="bundle")
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--glu-clamp", type=float, default=None)
@@ -137,6 +138,8 @@ def parse_args(argv=None):
         parser.error("distributed optimizer smoke requires --checkpoint-format torch_dist")
     if args.sr_rng == "triton_philox" and args.quantizer != "triton":
         parser.error("triton_philox SR requires --quantizer triton")
+    if args.value_checks == "grouped_deferred" and args.quantizer != "triton":
+        parser.error("grouped_deferred value checks require --quantizer triton")
     return args
 
 
@@ -207,6 +210,7 @@ def _make_config(args):
     config.fp4_rng_seed = args.seed
     config.fp4_quantizer = args.quantizer
     config.fp4_sr_rng = args.sr_rng
+    config.fp4_value_checks = args.value_checks
     config.use_distributed_optimizer = args.distributed_optimizer
     config.weight_deosc = args.deosc
     config.weight_deosc_accumulator_dtype = args.deosc_accumulator_dtype
@@ -972,6 +976,7 @@ def main():
         "recipe": args.recipe,
         "quantizer": args.quantizer,
         "sr_rng": args.sr_rng,
+        "value_checks": args.value_checks,
         "seed": args.seed,
         "model": {
             "implementation": "Megatron GPTModel",
