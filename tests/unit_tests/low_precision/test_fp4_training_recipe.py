@@ -62,6 +62,10 @@ def test_full_model_real_data_uses_default_shell_schedule_and_bounded_exit(recip
     assert args["weight_deosc_start_step"] == 768 and args["weight_deosc_period"] == 100
     assert args["weight_deosc_accumulator_dtype"] == "fp32"
     assert args["exp_avg_dtype"] == args["exp_avg_sq_dtype"] == "fp32"
+    assert args["use_turbo_fused_act_with_probs"] is False
+    assert args["bias_swiglu_fusion"] is False
+    assert args["use_te_activation_func"] is False
+    assert "RMSNorm" in manifest["activation_control"]
     assert args["save"] is args["load"] is None
     assert args["disable_last_saving"] is True and args["auto_continue_train"] is False
     assert args["recompute_granularity"] == "full" and args["recompute_num_layers"] == 1

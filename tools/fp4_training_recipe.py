@@ -182,6 +182,11 @@ def build_recipe(
         exp_avg_dtype="fp32",
         exp_avg_sq_dtype="fp32",
         turbo_fused_grouped_gemm=False,
+        # Reference FP4 uses eager SwiGLU/probability arithmetic. Both flags
+        # must be off: otherwise MX falls back to another fused activation.
+        use_turbo_fused_act_with_probs=False,
+        bias_swiglu_fusion=False,
+        use_te_activation_func=False,
         moe_permute_quant_fusion=False,
         moe_backward_permute_quant_fusion=False,
         moe_router_grad_merge=False,
@@ -240,6 +245,7 @@ def build_recipe(
             for key, val in changes.items()
         },
         "comparison_boundary": "Matched seed, data-index horizon, effective batch, LR schedule and evaluation steps; recipe comparison, not isolated format attribution",
+        "activation_control": "eager SwiGLU/probabilities for the no-bias, non-interleaved GPT-OSS configuration; RMSNorm and quantization/RHT remain route-specific",
         "deosc_boundary_difference": "Existing MXFP4 detector may approximate boundary shards; two-level detector uses exact global outer and boundary tile reconstruction",
         "deosc_settings": {
             "enabled": overrides["weight_deosc"],
