@@ -83,6 +83,7 @@ def build_recipe(
     recompute=True,
     admission=False,
     supplemental_dp4=False,
+    supplemental_dp4_prefix=False,
     sr_rng="torch_cpu",
     value_checks="strict",
 ):
@@ -90,6 +91,10 @@ def build_recipe(
         raise ValueError("Expected mxfp4/nvfp4/amdfp4 and a positive optimizer-update limit")
     if supplemental_dp4 and (not admission or steps != 8 or not recompute):
         raise ValueError("Supplemental DP4 requires admission, exactly eight updates, and full recompute")
+    if supplemental_dp4_prefix and (supplemental_dp4 or admission or steps != 128 or not recompute):
+        raise ValueError(
+            "Supplemental DP4 prefix requires exactly 128 updates, full recompute, and no admission"
+        )
     if sr_rng not in ("torch_cpu", "triton_philox"):
         raise ValueError("Expected sr_rng=torch_cpu or triton_philox")
     if value_checks not in ("strict", "grouped_deferred"):
@@ -147,7 +152,7 @@ def build_recipe(
         # pending and the existing MX DeOsc warmup path is outside that wrapper.
         SYNTH_WARMUP_STEPS="0",
     )
-    if supplemental_dp4:
+    if supplemental_dp4 or supplemental_dp4_prefix:
         environment.update(GPUS_PER_NODE="4", DGXSYSTEM="MI355X_1x4x1")
     original = expand(yaml.safe_load(base.read_text()), environment)
     result = copy.deepcopy(original)
@@ -212,6 +217,8 @@ def build_recipe(
         changes.update(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
     if admission:
         changes.update(weight_deosc_start_step=0, weight_deosc_period=2, eval_interval=4, eval_iters=1)
+    if supplemental_dp4_prefix:
+        changes.update(eval_interval=32, eval_iters=32)
     overrides.update(changes)
     if overrides["train_iters"] <= steps:
         raise ValueError("Bounded comparison must retain the original full training horizon")
@@ -263,7 +270,7 @@ def build_recipe(
         },
         "environment": environment,
     }
-    if supplemental_dp4:
+    if supplemental_dp4 or supplemental_dp4_prefix:
         geometry = dict(
             num_layers=24,
             hidden_size=2880,
@@ -294,6 +301,17 @@ def build_recipe(
             full_geometry=geometry,
             comparison_boundary="Supplemental DP4 real-data full-model eight-update admission; not the DP8 default or a 3000-update comparison",
         )
+    if supplemental_dp4_prefix:
+        if overrides["weight_deosc_start_step"] != 768 or overrides["weight_deosc_period"] != 100:
+            raise ValueError("Supplemental DP4 prefix must retain default DeOsc 768/100")
+        manifest.update(
+            scope="supplemental_dp4_prefix",
+            evaluation_interval=32,
+            evaluation_iters=32,
+            default_dp8_3000_comparison=False,
+            deosc_activated_in_prefix=False,
+            comparison_boundary="Supplemental DP4 128-update paired prefix with evaluation every 32 updates; before default DeOsc starts, not a DP8 or 3000-update comparison or convergence result",
+        )
     return result, manifest
 
 
@@ -308,7 +326,9 @@ def main():
     parser.add_argument("--tokenizer-dir", default="/model")
     parser.add_argument("--recompute", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--admission", action="store_true")
-    parser.add_argument("--supplemental-dp4", action="store_true")
+    supplemental = parser.add_mutually_exclusive_group()
+    supplemental.add_argument("--supplemental-dp4", action="store_true")
+    supplemental.add_argument("--supplemental-dp4-prefix", action="store_true")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     args = parser.parse_args()
@@ -322,6 +342,7 @@ def main():
         recompute=args.recompute,
         admission=args.admission,
         supplemental_dp4=args.supplemental_dp4,
+        supplemental_dp4_prefix=args.supplemental_dp4_prefix,
         sr_rng=args.sr_rng,
         value_checks=args.value_checks,
     )
