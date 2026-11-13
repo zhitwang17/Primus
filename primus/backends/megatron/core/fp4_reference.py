@@ -24,9 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from .fp4_contract import FP4RandomState, FP4TensorLayout, TwoLevelFP4Tensor
+from .fp4_rng import REFERENCE_RNG_VERSION
 
-# Checkpoint consumers record this separately from the numerical recipe.
-REFERENCE_RNG_VERSION = "torch-cpu-reservation-sha256-v1"
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _DTYPES = (torch.float32, torch.bfloat16)
 
@@ -115,6 +114,8 @@ def quantize(x, config, operand, *, outer_scale=None, random=None):
     RHT is a separate paired operation: use ``rht_pair`` before quantizing
     wgrad operands, so both receive exactly the same transform.
     """
+    if config.sr_rng != "torch_cpu":
+        raise ValueError("Torch reference quantization requires sr_rng=torch_cpu")
     _check_input(x)
     if x.ndim not in (2, 3):
         raise ValueError("FP4 reference quantization requires a 2-D or 3-D tensor")

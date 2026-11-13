@@ -30,7 +30,7 @@ Primus type; it is never passed to Turbo's block32/E8M0 `Float4QuantConfig`.
 | Autocast | `fp4_utils.py`: reference builder available without TE/Turbo, execution gate before fallback; NVFP4 TE path must have a real recipe object |
 | Module override | Turbo's existing per-module boundary consults the new selector; override flags and nested BF16 metadata scopes are respected |
 | Tensor payload | `TwoLevelFP4Tensor`: packed data, inner scale, required outer scale, config and layout together; shape/dtype/device/contiguity validation and metadata round-trip |
-| Randomness | `FP4RandomState`: private SR/RHT block reservations, deterministic domain-separated numeric keys, stable caller-supplied rank/module `stream_id`, checkpoint identity checks |
+| Randomness | `FP4RandomState`: private SR/RHT block reservations, deterministic domain-separated numeric keys, stable caller-supplied rank/module `stream_id`, checkpoint identity checks; default CPU SR or explicit Triton Philox SR |
 | Launcher | Explicit `PRIMUS_LINEAR_PRECISION`; no filename-based precision inference; preserve explicit LR/warmup; propagate config-export failures before launching |
 
 `auto` retains the existing MXFP4 path. For NVFP4 it can delegate to TE if no

@@ -76,6 +76,7 @@ fp4_rht_randomized: true
 fp4_gradient_sr: true
 fp4_rng_seed: null # defaults to training seed; private SR/RHT counter streams
 fp4_quantizer: torch # torch reference, or opt-in Triton two-level QDQ kernels
+fp4_sr_rng: torch_cpu # legacy CPU bitstream; triton_philox generates SR in GPU QDQ kernels
 
 first_last_layers_bf16: false
 num_layers_at_start_in_bf16: 1

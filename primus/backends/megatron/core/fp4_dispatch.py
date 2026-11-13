@@ -45,6 +45,7 @@ def build_two_level_config(config, fallback=None):
         "gradient_sr": ("fp4_gradient_sr", True),
         "rng_seed": ("fp4_rng_seed", option(config, "seed", 1234, fallback)),
         "quantizer": ("fp4_quantizer", "torch"),
+        "sr_rng": ("fp4_sr_rng", "torch_cpu"),
     }
     return TwoLevelFP4Config(
         recipe=_name(option(config, "fp4_recipe", fallback=fallback)),

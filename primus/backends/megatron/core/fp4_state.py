@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 from .fp4_contract import FP4RandomState
-from .fp4_reference import REFERENCE_RNG_VERSION
+from .fp4_rng import rng_implementation
 
 
 def _models(models):
@@ -105,7 +105,9 @@ def fp4_state_dict(models, optimizer=None, *, rank=None):
     return {
         "version": 1,
         "backend": "reference",
-        "rng_implementation": REFERENCE_RNG_VERSION,
+        "rng_implementation": rng_implementation(
+            config for _, module in _modules(models) for config in module.fp4_configs
+        ),
         "torch_version": str(torch.__version__),
         "topology": _topology(rank),
         "modules": modules,

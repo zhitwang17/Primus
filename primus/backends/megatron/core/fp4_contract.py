@@ -55,6 +55,7 @@ class TwoLevelFP4Config:
     rng_seed: int = 1234
     quantizer: str = "torch"
     version: int = 1
+    sr_rng: str = "torch_cpu"
 
     def __post_init__(self):
         object.__setattr__(self, "recipe", _name(self.recipe))
@@ -62,6 +63,10 @@ class TwoLevelFP4Config:
             raise ValueError("TwoLevelFP4Config requires nvfp4 or amdfp4")
         if self.quantizer not in ("torch", "triton"):
             raise ValueError("Two-level FP4 quantizer must be torch or triton")
+        if self.sr_rng not in ("torch_cpu", "triton_philox"):
+            raise ValueError("FP4 sr_rng must be torch_cpu or triton_philox")
+        if self.sr_rng == "triton_philox" and self.quantizer != "triton":
+            raise ValueError("FP4 sr_rng=triton_philox requires quantizer=triton")
         for key in ("weight_2d", "rht_randomized", "gradient_sr"):
             object.__setattr__(self, key, _boolean(getattr(self, key), key))
         if self.block_size != 16 or isinstance(self.block_size, bool):
@@ -89,7 +94,12 @@ class TwoLevelFP4Config:
         return 2.0**-6 if self.recipe == "nvfp4" else 2.0**-17
 
     def to_dict(self):
-        return asdict(self)
+        values = asdict(self)
+        # Existing CPU reservations derive seeds from the serialized recipe.
+        # Preserve that exact identity, bitstream and checkpoint compatibility.
+        if self.sr_rng == "torch_cpu":
+            values.pop("sr_rng")
+        return values
 
     @property
     def fingerprint(self):
@@ -281,8 +291,8 @@ class TwoLevelFP4Tensor:
 class FP4RandomState:
     """Private counter reservations; no consumption of global Torch/Python RNG.
 
-    The reference backend maps reservations to private CPU generators; a future
-    native Philox implementation needs a distinct checkpoint identity. Both
+    The default backend maps reservations to private CPU generators; the opt-in
+    GPU Philox implementation has a distinct recipe/checkpoint identity. Both
     wgrad operands must share the same RHT reservation. Reservations alone do
     not generate random numbers or establish parity with another backend.
     """

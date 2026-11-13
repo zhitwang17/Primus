@@ -9,8 +9,9 @@ block amax, scale rounding, E2M1 rounding and reconstruction without writing an
 intermediate packed payload; ``quantize``/``dequantize`` expose the actual packed
 contract for parity checks and future consumers. GEMMs remain a separate choice.
 
-SR uses the reference's versioned CPU generator and identical padded logical
-shape, so switching the quantizer does not invent a new random-number mapping.
+By default SR uses the reference's versioned CPU generator and identical padded
+logical shape. Explicit sr_rng=triton_philox instead generates Philox4x32-10
+uniforms inside the QDQ kernel, without a host random array or a uniform tensor.
 RHT remains the paired reference operation. Public value checks are enabled by
 default; ``check_values=False`` is an explicit finite-input profiling/internal
 contract, not a different numerical recipe.
@@ -24,6 +25,17 @@ import triton.language as tl
 
 from .fp4_contract import FP4TensorLayout, TwoLevelFP4Tensor
 from .fp4_reference import _check_random, _generator
+from .fp4_rng import reserve_philox_sr
+
+
+@triton.jit
+def _philox_uniform(seed, block_offset, logical_index):
+    # randint4x splits the uint64 offset into two uint32 counter words.
+    block = block_offset.to(tl.uint64) + logical_index.to(tl.uint64) // 4
+    a, b, c, d = tl.randint4x(seed, block, n_rounds=10)
+    lane = logical_index % 4
+    word = tl.where(lane == 0, a, tl.where(lane == 1, b, tl.where(lane == 2, c, d)))
+    return (word >> 8).to(tl.float32) * (1.0 / 16777216.0)
 
 
 @triton.jit
@@ -142,6 +154,8 @@ def _quantize_kernel(
     OUT,
     UNIFORM,
     ERROR,
+    RNG_SEED,
+    RNG_OFFSET,
     R: tl.constexpr,
     C: tl.constexpr,
     RP: tl.constexpr,
@@ -154,6 +168,7 @@ def _quantize_kernel(
     OC: tl.constexpr,
     TWO_D: tl.constexpr,
     STOCHASTIC: tl.constexpr,
+    GPU_RANDOM: tl.constexpr,
     DIRECT: tl.constexpr,
     CHECK: tl.constexpr,
     INNER_FLOOR: tl.constexpr,
@@ -195,9 +210,11 @@ def _quantize_kernel(
     scaled = tl.div_rn(value, combined)
     magnitude = tl.minimum(tl.abs(scaled), 6.0)
     if STOCHASTIC:
-        uniform = tl.load(
-            UNIFORM + (batch * RP + rows[:, None]) * CP + cols[None, :], rows[:, None] < RP, 0.0
-        )
+        logical_index = (batch.to(tl.uint64) * RP + rows[:, None].to(tl.uint64)) * CP + cols[None, :]
+        if GPU_RANDOM:
+            uniform = _philox_uniform(RNG_SEED, RNG_OFFSET, logical_index)
+        else:
+            uniform = tl.load(UNIFORM + logical_index, rows[:, None] < RP, 0.0)
     else:
         uniform = tl.full((16, 16), 0.0, tl.float32)
     code = _e2m1_code(magnitude, uniform, STOCHASTIC)
@@ -340,9 +357,15 @@ def _prepare(x, config, operand, outer_scale, random, check_values):
     layout = FP4TensorLayout(tuple(x.shape), tuple(physical_padded), operand)
     layout.validate(config)
     if operand.stochastic_rounding and b * rp * cp:
-        uniform = torch.rand(
-            (b, rp, cp), generator=_generator(random, "sr", b * rp * cp), dtype=torch.float32, device="cpu"
-        ).to(x.device)
+        if config.sr_rng == "triton_philox":
+            uniform = reserve_philox_sr(random, b * rp * cp)
+        else:
+            uniform = torch.rand(
+                (b, rp, cp),
+                generator=_generator(random, "sr", b * rp * cp),
+                dtype=torch.float32,
+                device="cpu",
+            ).to(x.device)
     else:
         uniform = outer
     return outer, layout, physical, (b, rp, cp), strides, uniform
@@ -357,14 +380,18 @@ def _launch(
         return
     _, out_strides = _shape_stride(out, operand.axis % out.ndim) if direct else ((0, 0, 0), (0, 0, 0))
     error = torch.zeros(1, dtype=torch.int32, device=x.device) if check_values else outer
+    gpu_random = config.sr_rng == "triton_philox" and operand.stochastic_rounding
+    seed, offset = (uniform["seed"], uniform["offset"]) if gpu_random else (0, 0)
     _quantize_kernel[(b * triton.cdiv(rp, 16) * (cp // 16),)](
         x,
         outer,
         packed,
         inner,
         out,
-        uniform,
+        outer if gpu_random else uniform,
         error,
+        seed,
+        offset,
         r,
         c,
         rp,
@@ -373,6 +400,7 @@ def _launch(
         *out_strides,
         operand.two_dimensional,
         operand.stochastic_rounding,
+        gpu_random,
         direct,
         check_values,
         config.inner_floor,

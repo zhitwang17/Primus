@@ -48,11 +48,32 @@ Turbo's direct fused FP32 wgrad accumulation/ownership optimization.
 Forward input/weight quantization is deterministic. Backward reserves private
 streams for gradient SR and randomized H32 (H16/disabled are explicit options).
 Both wgrad operands receive the same transform. Recomputed forwards consume no
-FP4 randomness. The reference mapping is
+FP4 randomness. The default `fp4_sr_rng: torch_cpu` mapping is
 `torch-cpu-reservation-sha256-v1`, which uses isolated CPU generators and copies
 random tensors to the device; it is not ALTO/Turbo Philox stream parity. Exact
 continuation requires the same Torch version. Value checks and routed lengths
 may synchronize the GPU: this backend favors inspectable correctness.
+
+For `fp4_quantizer: triton`, explicit `fp4_sr_rng: triton_philox` generates SR
+uniforms directly inside the quantization kernel. It allocates neither a CPU
+random tensor nor a device uniform buffer. The versioned mapping
+`philox4x32-10-counter64-u24-v1` uses Philox4x32 with ten rounds, a 64-bit block
+counter in counter words 0/1, zero words 2/3, and the private reservation key.
+Four consecutive axis-last padded logical elements select the four output
+words; each word's high 24 bits multiplied by `2**-24` produces an exactly
+representable FP32 uniform in `[0,1)`. Changing the launch tile preserves the
+mapping. Reservations reject counter overflow before mutation. Paired RHT
+retains its small CPU reference stream. This is a distinct stochastic recipe,
+not bitwise parity with the CPU SR implementation or ALTO/Turbo.
+
+The default omits the new field from serialized contracts, preserving existing
+CPU fingerprints, private streams and checkpoint identities. The GPU mode adds
+its algorithm version to checkpoint identity and rejects CPU/GPU switching on
+resume. CPU known-answer/distribution tests and Triton's CPU interpreter cover
+both recipe grids, dgrad/wgrad axes, nonaligned shapes, large counter offsets,
+exact continuation and the absence of host SR arrays. Device execution and
+end-to-end training qualification remain separate gates; a hardware test is
+included in `test_fp4_gpu_rng.py` and skips without an allocated GPU.
 
 DeOsc uses the same BF16 pre-rounding and whole-bank forward grid as the GEMM.
 It defaults to Primus's BF16 snapshot/subtraction policy, FP32 distance sums,
@@ -89,7 +110,7 @@ base/train/eval routing and override flags, recipe fingerprints, SR/RHT offsets,
 Torch/RNG implementation, rank/world size and DeOsc history. Missing/mismatched
 state fails explicitly; `finetune` is an explicit fresh-state operation.
 The numerical RNG stream excludes the `fp4_quantizer` implementation choice,
-so Torch/Triton comparisons do not change the random sequence. The complete
+so Torch/Triton comparisons with `fp4_sr_rng: torch_cpu` do not change the random sequence. The complete
 checkpoint identity still includes that choice and rejects implementation
 switches on resume. Older checkpoints without the new quantizer identity also
 fail strict continuation; no implicit migration is performed.
@@ -195,8 +216,9 @@ python tools/fp4_smoke.py --recipe amdfp4 --steps 4 --deosc --output /results/am
 fused direct-QDQ implementation for all three GEMM directions and DeOsc.
 The latter skips materializing packed bytes during QDQ while preserving exactly
 the quantization grid and BF16 output. The public packed quant/dequant API is
-also implemented and independently checked. SR keeps the reference private CPU
-reservations; paired RHT is unchanged. No quantized weight cache is retained.
+also implemented and independently checked. SR defaults to the reference CPU
+mapping; `fp4_sr_rng: triton_philox` selects the explicit GPU mapping described
+above. Paired RHT is unchanged. No quantized weight cache is retained.
 
 The `gpt-oss` smoke profile keeps hidden2880, heads64, query groups8, head_dim64,
 32 experts/top4 and expert FFN2880 from the pinned Primus model. It reduces the

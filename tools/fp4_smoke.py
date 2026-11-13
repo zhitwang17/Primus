@@ -74,6 +74,7 @@ def _source_fingerprints():
                 "fp4_triton",
                 "fp4_autograd",
                 "fp4_state",
+                "fp4_rng",
                 "fp4_checkpoint",
                 "optimizer/two_level_fp4_deosc",
                 "extensions/two_level_fp4",
@@ -103,6 +104,7 @@ def parse_args(argv=None):
     parser.add_argument("--vocab-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
+    parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--checkpoint-format", choices=("bundle", "torch_dist"), default="bundle")
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--glu-clamp", type=float, default=None)
@@ -133,6 +135,8 @@ def parse_args(argv=None):
         parser.error("gradient-accumulation-steps must be positive")
     if args.distributed_optimizer and args.checkpoint_format != "torch_dist":
         parser.error("distributed optimizer smoke requires --checkpoint-format torch_dist")
+    if args.sr_rng == "triton_philox" and args.quantizer != "triton":
+        parser.error("triton_philox SR requires --quantizer triton")
     return args
 
 
@@ -202,6 +206,7 @@ def _make_config(args):
     config.fp4_backend = "reference"
     config.fp4_rng_seed = args.seed
     config.fp4_quantizer = args.quantizer
+    config.fp4_sr_rng = args.sr_rng
     config.use_distributed_optimizer = args.distributed_optimizer
     config.weight_deosc = args.deosc
     config.weight_deosc_accumulator_dtype = args.deosc_accumulator_dtype
@@ -357,10 +362,7 @@ def _initialize_adam_state(optimizer, *unused):
 def _build_training_objects(args, config):
     import torch
     import torch.distributed as dist
-    from megatron.core.distributed import (
-        DistributedDataParallel,
-        DistributedDataParallelConfig,
-    )
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -417,9 +419,7 @@ def _build_training_objects(args, config):
         )
     runners = []
     if args.deosc:
-        from primus.backends.megatron.core.optimizer.two_level_fp4_deosc import (
-            install_megatron_deosc,
-        )
+        from primus.backends.megatron.core.optimizer.two_level_fp4_deosc import install_megatron_deosc
 
         runners = install_megatron_deosc(
             optimizer,
@@ -727,13 +727,8 @@ def run(args, result):
 
     from primus.backends.megatron.core.fp4_autograd import execution_counts
     from primus.backends.megatron.core.fp4_dispatch import resolve_fp4_plan
-    from primus.backends.megatron.patches.turbo.fp4_patches import (
-        patch_enums,
-        patch_fp4_context,
-    )
-    from primus.backends.megatron.patches.two_level_fp4_patches import (
-        install_two_level_fp4_spec_provider,
-    )
+    from primus.backends.megatron.patches.turbo.fp4_patches import patch_enums, patch_fp4_context
+    from primus.backends.megatron.patches.two_level_fp4_patches import install_two_level_fp4_spec_provider
 
     result["environment"] = {
         "python": platform.python_version(),
@@ -976,6 +971,7 @@ def main():
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "recipe": args.recipe,
         "quantizer": args.quantizer,
+        "sr_rng": args.sr_rng,
         "seed": args.seed,
         "model": {
             "implementation": "Megatron GPTModel",
