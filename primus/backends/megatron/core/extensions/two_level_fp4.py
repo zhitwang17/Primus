@@ -309,6 +309,7 @@ class TwoLevelFP4LayerNormColumnParallelLinear(TwoLevelFP4ColumnParallelLinear):
     def _init_before_linear_parameters(self, input_size, config):
         self.fp4_comparison_rmsnorm_backend = comparison_rmsnorm_backend(_options(config))
         self.fp4_comparison_rmsnorm_calls = 0
+        self.fp4_external_rmsnorm_calls = 0
         self.normalization = getattr(config, "normalization", "LayerNorm")
         if self.normalization not in ("LayerNorm", "RMSNorm"):
             raise ValueError(f"Unsupported reference normalization: {self.normalization}")
@@ -332,6 +333,14 @@ class TwoLevelFP4LayerNormColumnParallelLinear(TwoLevelFP4ColumnParallelLinear):
             self.layer_norm_bias.tensor_model_parallel = False
 
     def forward(self, x, **kwargs):
+        if getattr(self, "_skip_fused_norm", False):
+            # The residual/RMSNorm fusion already normalized this input and
+            # owns the norm-parameter gradients. Its QKV slot uses this same
+            # contract for native MXFP4 and reference two-level FP4 modules.
+            if self.normalization != "RMSNorm":
+                raise ValueError("External fused normalization requires RMSNorm")
+            self.fp4_external_rmsnorm_calls += 1
+            return super().forward(x, **kwargs)
         gamma = self.layer_norm_weight + 1 if self.zero_centered_gamma else self.layer_norm_weight
         if self.normalization == "RMSNorm":
             if self.fp4_comparison_rmsnorm_backend == "torch":
@@ -449,6 +458,10 @@ class TwoLevelFP4GroupedMLP(MegatronModule):
         if getattr(config, "use_transformer_engine_op_fuser", False):
             raise ValueError("Reference FP4 MLP does not implement TE op fusion")
         self.num_local_experts = num_local_experts
+        self.use_turbo_fused_act_with_probs = bool(
+            _options(config).get("use_turbo_fused_act_with_probs", False)
+        )
+        self.fp4_fused_activation_calls = 0
         self.tp_group = getattr(pg_collection, "expt_tp", None)
         self.ep_group = getattr(pg_collection, "ep", None)
         hidden = getattr(config, "moe_latent_size", None) or config.hidden_size
@@ -480,7 +493,42 @@ class TwoLevelFP4GroupedMLP(MegatronModule):
             name=f"{name}.linear_fc2" if name else None,
         )
 
-    def _activate(self, x, probs):
+    def _activate(self, x, probs, tokens_per_expert=None):
+        if getattr(self, "use_turbo_fused_act_with_probs", False):
+            # The activation/probability fusion consumes ordinary BF16 tensors;
+            # it is independent of the GEMM's FP4 operand format. Preserve the
+            # native default's kernel and its supported GLU contract.
+            if (
+                not self.config.gated_linear_unit
+                or getattr(self.config, "moe_mlp_glu_interleave_size", None) is not None
+                or getattr(self.config, "glu_linear_offset", 0.0) != 0.0
+                or getattr(self.config, "activation_func_fp8_input_store", False)
+            ):
+                raise ValueError(
+                    "Turbo FP4 activation requires non-interleaved GLU, zero offset and no FP8 activation store"
+                )
+            if tokens_per_expert is None:
+                raise ValueError("Turbo FP4 activation requires expert token counts")
+            if self.config.activation_func is F.silu:
+                activation = "silu"
+            elif self.config.activation_func is F.gelu:
+                activation = "gelu"
+            else:
+                raise ValueError("Turbo FP4 activation supports only SiLU and GELU")
+            from primus.backends.megatron.core.extensions.primus_turbo import (
+                fused_bias_act_with_probs,
+            )
+
+            lengths = torch.as_tensor(tokens_per_expert, device=x.device)
+            self.fp4_fused_activation_calls += 1
+            return fused_bias_act_with_probs(
+                x,
+                None,
+                probs.reshape(-1),
+                lengths,
+                activation,
+                getattr(self.config, "activation_func_clamp_value", None),
+            )
         if self.config.gated_linear_unit:
             interleave = getattr(self.config, "moe_mlp_glu_interleave_size", None)
             if interleave is not None:
@@ -521,9 +569,11 @@ class TwoLevelFP4GroupedMLP(MegatronModule):
         ):
             from torch.utils.checkpoint import checkpoint
 
-            activated = checkpoint(self._activate, intermediate, probs, use_reentrant=False)
+            activated = checkpoint(
+                self._activate, intermediate, probs, tokens_per_expert, use_reentrant=False
+            )
         else:
-            activated = self._activate(intermediate, probs)
+            activated = self._activate(intermediate, probs, tokens_per_expert)
         output, bias = self.linear_fc2(activated, tokens_per_expert)
         if bias is not None:
             from primus.backends.megatron.core.fp4_autograd import _lengths

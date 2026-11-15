@@ -497,7 +497,18 @@ def _wrap_optimizer(opt, runner):
                 raise RuntimeError(
                     "DeOsc requires exactly one main-to-model copy per successful optimizer step"
                 )
+            snapped_before = runner.stats["snapped"]
             runner.step()
+            if runner.stats["snapped"] != snapped_before and getattr(
+                opt, "_primus_bf16_writeback_active", False
+            ):
+                # Fused Adam has already written its pre-DeOsc FP32 masters to
+                # BF16. A snap invalidates that writeback for this leaf: let
+                # its normal MCore copy publish the updated masters before
+                # parameter gathering. The next Adam step re-enables fused
+                # writeback normally. No-snap steps retain the skip fast path;
+                # constructor/reload copies and failed updates never enter here.
+                opt._primus_bf16_writeback_active = False
             status["copies"] += 1
         return original_copy(*args, **kwargs)
 

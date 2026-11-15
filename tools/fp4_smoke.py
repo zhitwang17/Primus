@@ -8,6 +8,13 @@ convergence or throughput benchmark, and does not use FlyDSL attention. The
 gpt-oss profile retains the original hidden/head/expert geometry; only depth,
 sequence, batch and vocabulary are reduced. Use torchrun for two replicated DP
 ranks, one visible GPU per local rank.
+
+The explicit ``--optimizer-profile default-bf16-adam`` qualification retains
+Primus's BF16 Adam moments, device-side clipping, BF16 gradients/writeback and
+MCore FP32 masters. It requires real DP2 or larger, DeOsc and torch_dist
+checkpoint replay. It uses the reduced synthetic model above, not the complete
+MLPerf workload; eight steps are recommended to observe snaps before and after
+restore. A run without an actual BF16-changing DeOsc snap fails qualification.
 """
 
 from __future__ import annotations
@@ -82,6 +89,9 @@ def _source_fingerprints():
             )
         ],
         "primus/backends/megatron/patches/two_level_fp4_patches.py",
+        "primus/backends/megatron/patches/te_patches/fused_adam_clip_patches.py",
+        "primus/backends/megatron/patches/te_patches/fused_adam_clip_kernel.cu",
+        "third_party/Megatron-LM/megatron/core/optimizer/distrib_optimizer.py",
         "third_party/Megatron-LM/megatron/core/transformer/moe/moe_utils.py",
     ]
     files.extend(
@@ -115,6 +125,12 @@ def parse_args(argv=None):
     parser.add_argument("--glu-offset", type=float, default=0.0)
     parser.add_argument("--deosc", action="store_true")
     parser.add_argument("--distributed-optimizer", action="store_true")
+    parser.add_argument(
+        "--optimizer-profile",
+        choices=("fp32", "default-bf16-adam"),
+        default="fp32",
+        help="Opt in to the default Primus BF16-moment fused Adam compatibility qualification",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--deosc-accumulator-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument(
@@ -128,7 +144,15 @@ def parse_args(argv=None):
     args.batch_size = (
         args.batch_size if args.batch_size is not None else (1 if args.model_profile == "gpt-oss" else 2)
     )
-    args.lr = args.lr if args.lr is not None else (5.7e-4 if args.model_profile == "gpt-oss" else 0.002)
+    args.lr = (
+        args.lr
+        if args.lr is not None
+        else (
+            5.7e-4
+            if args.model_profile == "gpt-oss" or args.optimizer_profile == "default-bf16-adam"
+            else 0.002
+        )
+    )
     if args.steps < 2 or (args.deosc and args.steps < 4):
         parser.error("checkpoint smoke needs at least two updates; DeOsc needs at least four")
     if args.glu_clamp is not None and args.glu_clamp <= 0:
@@ -139,11 +163,61 @@ def parse_args(argv=None):
         parser.error("gradient-accumulation-steps must be positive")
     if args.distributed_optimizer and args.checkpoint_format != "torch_dist":
         parser.error("distributed optimizer smoke requires --checkpoint-format torch_dist")
+    if args.optimizer_profile == "default-bf16-adam" and not (
+        args.distributed_optimizer and args.deosc and args.checkpoint_format == "torch_dist"
+    ):
+        parser.error(
+            "default-bf16-adam requires --distributed-optimizer --deosc --checkpoint-format torch_dist"
+        )
     if args.sr_rng == "triton_philox" and args.quantizer != "triton":
         parser.error("triton_philox SR requires --quantizer triton")
     if args.value_checks == "grouped_deferred" and args.quantizer != "triton":
         parser.error("grouped_deferred value checks require --quantizer triton")
     return args
+
+
+_DEFAULT_BF16_ADAM_ENV = {
+    "PRIMUS_FUSED_ADAM_CLIP": "1",
+    "PRIMUS_FUSED_ADAM_BF16_GRAD": "1",
+    "PRIMUS_FUSED_ADAM_BF16_WRITEBACK": "1",
+    "PRIMUS_FUSED_ADAM_MCORE_MASTER": "1",
+    "PRIMUS_STATIC_BF16_LOSS_SCALE_CPU": "1",
+}
+
+
+def _configure_optimizer_profile(args):
+    # Set these before importing/installing patches or constructing any optimizer
+    # config: the MCore-master override runs inside OptimizerConfig.__post_init__.
+    if args.optimizer_profile == "default-bf16-adam":
+        os.environ.update(_DEFAULT_BF16_ADAM_ENV)
+        return dict(_DEFAULT_BF16_ADAM_ENV)
+    return {}
+
+
+def _distributed_optimizer_kwargs(args):
+    import torch
+
+    options = dict(
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        lr=args.lr,
+        clip_grad=0.0,
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        weight_decay=0.0,
+        use_distributed_optimizer=True,
+    )
+    if args.optimizer_profile == "default-bf16-adam":
+        options.update(
+            clip_grad=1.0,
+            adam_eps=1e-5,
+            weight_decay=0.1,
+            use_precision_aware_optimizer=True,
+            main_params_dtype=torch.float32,
+            exp_avg_dtype=torch.bfloat16,
+            exp_avg_sq_dtype=torch.bfloat16,
+        )
+    return options
 
 
 def _make_config(args):
@@ -426,7 +500,10 @@ def _initialize_adam_state(optimizer, *unused):
 def _build_training_objects(args, config):
     import torch
     import torch.distributed as dist
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed import (
+        DistributedDataParallel,
+        DistributedDataParallelConfig,
+    )
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -448,7 +525,7 @@ def _build_training_objects(args, config):
     ddp = DistributedDataParallel(
         config,
         DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True,
+            grad_reduce_in_fp32=args.optimizer_profile != "default-bf16-adam",
             overlap_grad_reduce=True,
             use_distributed_optimizer=args.distributed_optimizer,
             overlap_param_gather=False,
@@ -460,16 +537,7 @@ def _build_training_objects(args, config):
         # Use the real MCore construction path, including separate expert and
         # dense leaf optimizers and the actual DDP buffer partition mapping.
         optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                bf16=True,
-                params_dtype=torch.bfloat16,
-                lr=args.lr,
-                clip_grad=0.0,
-                adam_beta1=0.9,
-                adam_beta2=0.95,
-                weight_decay=0.0,
-                use_distributed_optimizer=True,
-            ),
+            OptimizerConfig(**_distributed_optimizer_kwargs(args)),
             [ddp],
         )
     else:
@@ -483,7 +551,9 @@ def _build_training_objects(args, config):
         )
     runners = []
     if args.deosc:
-        from primus.backends.megatron.core.optimizer.two_level_fp4_deosc import install_megatron_deosc
+        from primus.backends.megatron.core.optimizer.two_level_fp4_deosc import (
+            install_megatron_deosc,
+        )
 
         runners = install_megatron_deosc(
             optimizer,
@@ -568,12 +638,15 @@ def _step(
     *,
     distributed_optimizer=False,
     gradient_accumulation_steps=1,
+    optimizer_observer=None,
 ):
     import torch
     import torch.distributed as dist
 
     torch.cuda.synchronize()
     started = time.perf_counter()
+    if optimizer_observer is not None:
+        optimizer_observer.begin_step()
     optimizer.zero_grad()
     ddp.zero_grad_buffer()
     loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
@@ -617,6 +690,8 @@ def _step(
     success, _, _ = optimizer.step()
     if not success:
         raise AssertionError("Optimizer skipped an update")
+    if optimizer_observer is not None:
+        row["optimizer_qualification"] = optimizer_observer.after_step()
     if any(not _finite(param) for param in model.parameters()):
         raise AssertionError("Non-finite model parameter after optimizer update")
     row["parameter_sync"] = _assert_replicated(model.named_parameters(), "model parameters")
@@ -632,9 +707,14 @@ def _step(
         for parameter in masters:
             if parameter.dtype != torch.float32 or not _finite(parameter):
                 raise AssertionError("Invalid local FP32 optimizer shard")
-            if parameter.grad is None or not _finite(parameter.grad):
+            gradient = (
+                getattr(parameter, "decoupled_grad", None)
+                if optimizer_observer is not None
+                else parameter.grad
+            )
+            if gradient is None or not _finite(gradient):
                 raise AssertionError("Missing or non-finite reduced optimizer gradient shard")
-            gradient_squares.add_(_squared_norm(parameter.grad))
+            gradient_squares.add_(_squared_norm(gradient))
         dist.all_reduce(gradient_squares)
         row["global_grad_norm"] = float(gradient_squares.sqrt())
         row["gradient_sync"] = {"status": "reduce_scatter", "finite_owned_gradients": True}
@@ -710,6 +790,179 @@ def _optimizer_leaves(optimizer):
             yield from _optimizer_leaves(child)
 
 
+def _default_optimizer_evidence(optimizer, *, require_update=True):
+    """Inspect actual tensors, not requested dtype fields in a recipe.
+
+    Compare every owned master with both its BF16 writeback buffer and its model
+    coordinates. The latter prevents an internally consistent but incorrect
+    writeback mapping from being accepted. This is deliberately a slow smoke
+    check; full training must not put it on the optimizer critical path.
+    """
+    import torch
+
+    dtypes = {name: set() for name in ("master", "model", "exp_avg", "exp_avg_sq", "gradient")}
+    parameters = elements = 0
+    for leaf in _optimizer_leaves(optimizer):
+        if leaf.optimizer is None:
+            continue
+        if not leaf.config.use_precision_aware_optimizer or (
+            leaf.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        ):
+            raise AssertionError("BF16 Adam qualification requires explicit MCore FP32 master ownership")
+        inner = leaf.optimizer
+        seen = set()
+        if len(leaf.model_float16_groups) != len(leaf.shard_fp32_from_float16_groups):
+            raise AssertionError("Optimizer model/master groups differ")
+        for models, masters in zip(leaf.model_float16_groups, leaf.shard_fp32_from_float16_groups):
+            if len(models) != len(masters):
+                raise AssertionError("Optimizer model/master group sizes differ")
+            for model, master in zip(models, masters):
+                if master.dtype != torch.float32 or model.dtype != torch.bfloat16:
+                    raise AssertionError("Expected actual FP32 master and BF16 model tensors")
+                state = inner.state.get(master, {})
+                for name in ("exp_avg", "exp_avg_sq"):
+                    moment = state.get(name)
+                    if not isinstance(moment, torch.Tensor) or moment.dtype != torch.bfloat16:
+                        raise AssertionError(f"Actual Adam {name} must be BF16")
+                    if moment.shape != master.shape or not _finite(moment):
+                        raise AssertionError(f"Invalid Adam {name} shape or values")
+                    dtypes[name].add(str(moment.dtype))
+                if not _finite(master):
+                    raise AssertionError("Non-finite FP32 master")
+                coordinates = leaf._get_model_param_range_map(model)
+                interval = coordinates["param"]
+                model_shard = model.detach().view(-1)[interval.start : interval.end]
+                expected = master.detach().reshape(-1).to(torch.bfloat16)
+                if not torch.equal(model_shard, expected):
+                    raise AssertionError("FP32 master differs from its BF16 model shard after writeback")
+                if require_update:
+                    destination = inner._primus_bf16_writeback_by_param_ptr.get(master.data_ptr())
+                    if (
+                        destination is None
+                        or destination.dtype != torch.bfloat16
+                        or not torch.equal(destination.reshape(-1), expected)
+                    ):
+                        raise AssertionError("Fused Adam BF16 writeback buffer is missing or stale")
+                    gradient = getattr(master, "decoupled_grad", None)
+                    if gradient is None or gradient.dtype != torch.bfloat16 or not _finite(gradient):
+                        raise AssertionError(
+                            "Default fused Adam did not consume finite BF16 decoupled gradients"
+                        )
+                    dtypes["gradient"].add(str(gradient.dtype))
+                seen.add(id(master))
+                parameters += 1
+                elements += master.numel()
+                dtypes["master"].add(str(master.dtype))
+                dtypes["model"].add(str(model.dtype))
+        actual = {id(param) for group in inner.param_groups for param in group["params"]}
+        if seen != actual:
+            raise AssertionError("BF16 model/writeback check did not cover every optimizer parameter")
+    if not parameters:
+        raise AssertionError("BF16 Adam qualification has no owned optimizer parameters")
+    return {
+        "actual_dtypes": {name: sorted(values) for name, values in dtypes.items()},
+        "owned_master_parameters": parameters,
+        "owned_master_elements": elements,
+        "all_owned_master_model_shards_exact": True,
+        "all_owned_bf16_writeback_buffers_exact": bool(require_update),
+        "explicit_mcore_fp32_masters": True,
+    }
+
+
+class _DefaultBF16AdamObserver:
+    """Observe real HIP Adam and DeOsc calls without changing training state."""
+
+    def __init__(self, optimizer, runners):
+        from functools import wraps
+
+        self.optimizer = optimizer
+        self.begin_step()
+        for leaf in _optimizer_leaves(optimizer):
+            if leaf.optimizer is None:
+                continue
+            inner = leaf.optimizer
+            original_adam = getattr(inner, "multi_tensor_adam", None)
+            if getattr(original_adam, "__name__", "") != "fused_multi_tensor_adam":
+                raise AssertionError("Default qualification requires the actual Primus fused Adam callback")
+
+            @wraps(original_adam)
+            def observed_adam(*args, _call=original_adam, **kwargs):
+                result = _call(*args, **kwargs)
+                self.fused_adam_calls += 1
+                return result
+
+            inner.multi_tensor_adam = observed_adam
+        if not runners:
+            raise AssertionError("Default optimizer qualification requires DeOsc runners")
+        for runner in runners:
+            original_step = runner.step
+
+            @wraps(original_step)
+            def observed_deosc(*args, _runner=runner, _call=original_step, **kwargs):
+                import torch
+
+                before = {
+                    key: master.detach().to(torch.bfloat16).clone()
+                    for key, (_, master, _) in _runner.bindings.items()
+                }
+                snapped_before = _runner.stats["snapped"]
+                result = _call(*args, **kwargs)
+                snapped = _runner.stats["snapped"] - snapped_before
+                changed = sum(
+                    int(torch.count_nonzero(before[key] != master.to(torch.bfloat16)).item())
+                    for key, (_, master, _) in _runner.bindings.items()
+                )
+                if changed > snapped:
+                    raise AssertionError("DeOsc changed BF16 weights outside its reported snap mask")
+                self.deosc_snapped += snapped
+                self.deosc_changed_bf16 += changed
+                return result
+
+            runner.step = observed_deosc
+
+    def begin_step(self):
+        self.fused_adam_calls = 0
+        self.deosc_snapped = 0
+        self.deosc_changed_bf16 = 0
+
+    def after_step(self):
+        evidence = _default_optimizer_evidence(self.optimizer)
+        if self.fused_adam_calls <= 0:
+            raise AssertionError("No actual Primus fused Adam kernel callback completed")
+        return {
+            **evidence,
+            "fused_adam_calls": self.fused_adam_calls,
+            "deosc_snapped_local": self.deosc_snapped,
+            "deosc_changed_bf16_local": self.deosc_changed_bf16,
+        }
+
+
+def _qualification_totals(steps, device):
+    import torch
+    import torch.distributed as dist
+
+    counts = torch.tensor(
+        [
+            sum(row["optimizer_qualification"][key] for row in steps)
+            for key in ("fused_adam_calls", "deosc_snapped_local", "deosc_changed_bf16_local")
+        ],
+        device=device,
+        dtype=torch.int64,
+    )
+    dist.all_reduce(counts)
+    calls, snapped, changed = counts.cpu().tolist()
+    if calls <= 0 or snapped <= 0 or changed <= 0:
+        raise AssertionError(
+            f"Qualification requires actual fused Adam and a propagated BF16-changing DeOsc snap: "
+            f"calls={calls}, snapped={snapped}, changed={changed}; run more smoke steps if necessary"
+        )
+    return {
+        "global_fused_adam_calls": calls,
+        "global_deosc_snapped": snapped,
+        "global_deosc_changed_bf16": changed,
+    }
+
+
 def _complete_optimizer_state(optimizer):
     # DistributedOptimizer.state_dict intentionally omits the parameter state,
     # which is saved by a separate sharded-checkpoint path. Include real local
@@ -721,6 +974,16 @@ def _complete_optimizer_state(optimizer):
             {
                 "wrapper": type(leaf).__name__,
                 "inner_state": leaf.optimizer.state_dict() if leaf.optimizer is not None else None,
+                # TE serializes BF16 moments as FP32. Fingerprint raw storage as
+                # well so restoration of the wrong actual dtype cannot pass.
+                "raw_inner_state": (
+                    [
+                        [leaf.optimizer.state.get(param, {}) for param in group["params"]]
+                        for group in leaf.optimizer.param_groups
+                    ]
+                    if leaf.optimizer is not None
+                    else None
+                ),
                 "fp32_masters": list(leaf.get_parameters()),
             }
             for leaf in _optimizer_leaves(optimizer)
@@ -768,6 +1031,7 @@ def _changed_parameters(model, initial, identities):
 
 
 def run(args, result):
+    result["optimizer_environment"] = _configure_optimizer_profile(args)
     import torch
     import torch.distributed as dist
 
@@ -782,6 +1046,8 @@ def run(args, result):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size not in (1, 2, 4, 8):
         raise RuntimeError("The reference smoke supports one, two, four or eight DP ranks")
+    if args.optimizer_profile == "default-bf16-adam" and world_size < 2:
+        raise RuntimeError("Default BF16 Adam qualification requires at least two real DP ranks")
     if not torch.cuda.is_available() or torch.cuda.device_count() != world_size:
         raise RuntimeError("Expose exactly one GPU per local torchrun rank using ROCR_VISIBLE_DEVICES")
     torch.cuda.set_device(local_rank)
@@ -791,9 +1057,16 @@ def run(args, result):
 
     from primus.backends.megatron.core.fp4_autograd import execution_counts
     from primus.backends.megatron.core.fp4_dispatch import resolve_fp4_plan
-    from primus.backends.megatron.patches.attention_backend_patches import patch_attention_backend
-    from primus.backends.megatron.patches.turbo.fp4_patches import patch_enums, patch_fp4_context
-    from primus.backends.megatron.patches.two_level_fp4_patches import install_two_level_fp4_spec_provider
+    from primus.backends.megatron.patches.attention_backend_patches import (
+        patch_attention_backend,
+    )
+    from primus.backends.megatron.patches.turbo.fp4_patches import (
+        patch_enums,
+        patch_fp4_context,
+    )
+    from primus.backends.megatron.patches.two_level_fp4_patches import (
+        install_two_level_fp4_spec_provider,
+    )
 
     result["environment"] = {
         "python": platform.python_version(),
@@ -829,10 +1102,21 @@ def run(args, result):
                 patch_attention_backend(None)
             patch_fp4_context(None)
             install_two_level_fp4_spec_provider()
+            if args.optimizer_profile == "default-bf16-adam":
+                from primus.backends.megatron.patches.te_patches.fused_adam_clip_patches import (
+                    patch_te_fused_adam_clip,
+                )
+
+                patch_te_fused_adam_clip(None)
             config = _make_config(args)
             result["plan"] = resolve_fp4_plan(config).to_dict()
             torch.cuda.reset_peak_memory_stats()
             model, ddp, optimizer, runners = _build_training_objects(args, config)
+            optimizer_observer = (
+                _DefaultBF16AdamObserver(optimizer, runners)
+                if args.optimizer_profile == "default-bf16-adam"
+                else None
+            )
             model.train()
             result["rmsnorm"] = {
                 "initial": _rmsnorm_snapshot(
@@ -912,6 +1196,7 @@ def run(args, result):
                         args.vocab_size,
                         distributed_optimizer=args.distributed_optimizer,
                         gradient_accumulation_steps=args.gradient_accumulation_steps,
+                        optimizer_observer=optimizer_observer,
                     )
                 )
                 if step + 1 == checkpoint_step:
@@ -937,16 +1222,35 @@ def run(args, result):
             ]
             if runners and any(runner.stats.get("periods", 0) < 1 for runner in runners):
                 raise AssertionError("DeOsc smoke did not reach a completed period")
+            if optimizer_observer is not None:
+                result["optimizer_qualification"] = {
+                    "status": "checkpoint_pending",
+                    "profile": args.optimizer_profile,
+                    "scope": (
+                        "Real DP optimizer/DeOsc/checkpoint compatibility; "
+                        "reduced synthetic model, not convergence"
+                    ),
+                    "deosc_start_step": 0,
+                    "deosc_period": 2,
+                    "deosc_ratio": 4.0,
+                    "training": _qualification_totals(result["steps"], input_ids.device),
+                }
             expected_fingerprints = _training_fingerprints(model, optimizer)
             # Do not retain two large models, optimizer masters/moments or DeOsc
             # histories while testing the original GPT-OSS expert-bank geometry.
-            del model, ddp, optimizer, runners
+            del model, ddp, optimizer, runners, optimizer_observer
             gc.collect()
             torch.cuda.empty_cache()
             result["memory"]["after_releasing_original"] = _memory_summary()
             torch.cuda.reset_peak_memory_stats()
             fresh_model, fresh_ddp, fresh_optimizer, fresh_runners = _build_training_objects(args, config)
             _load_checkpoint(args, fresh_model, fresh_optimizer, checkpoint_directory, checkpoint_step)
+            fresh_observer = None
+            if args.optimizer_profile == "default-bf16-adam":
+                result["optimizer_qualification"]["restored_actual_state"] = _default_optimizer_evidence(
+                    fresh_optimizer, require_update=False
+                )
+                fresh_observer = _DefaultBF16AdamObserver(fresh_optimizer, fresh_runners)
             fresh_model.train()
             result["rmsnorm"]["restored_before_replay"] = _rmsnorm_snapshot(
                 fresh_model, args.comparison_rmsnorm_backend, config.num_layers, pristine=True
@@ -974,6 +1278,7 @@ def run(args, result):
                     args.vocab_size,
                     distributed_optimizer=args.distributed_optimizer,
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    optimizer_observer=fresh_observer,
                 )
                 for step in range(checkpoint_step, args.steps)
             ]
@@ -1001,6 +1306,9 @@ def run(args, result):
                 "losses_and_gradients",
             )
             _assert_equal(expected_fingerprints, actual_fingerprints, "complete_training_state_sha256")
+            if fresh_observer is not None:
+                result["optimizer_qualification"]["replay"] = _qualification_totals(replay, input_ids.device)
+                result["optimizer_qualification"]["status"] = "passed"
             result["checkpoint_replay"] = {
                 "status": "passed",
                 "format": args.checkpoint_format,
@@ -1033,10 +1341,11 @@ def run(args, result):
                     "gradient_sync": result["steps"][-1]["gradient_sync"],
                     "parameter_sync": result["steps"][-1]["parameter_sync"],
                     "master_sync": result["steps"][-1]["master_sync"],
+                    "optimizer_qualification": result.get("optimizer_qualification"),
                 },
             )
             result["rank_results"] = rank_summaries
-            del fresh_model, fresh_ddp, fresh_optimizer, fresh_runners
+            del fresh_model, fresh_ddp, fresh_optimizer, fresh_runners, fresh_observer
             gc.collect()
             dist.barrier()  # All ranks must finish restore before rank0 deletes temporary files.
         finally:
@@ -1057,6 +1366,7 @@ def main():
         "status": "running",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "recipe": args.recipe,
+        "optimizer_profile": args.optimizer_profile,
         "quantizer": args.quantizer,
         "sr_rng": args.sr_rng,
         "value_checks": args.value_checks,
