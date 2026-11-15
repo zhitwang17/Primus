@@ -28,6 +28,7 @@ from primus.core.utils.module_utils import log_rank_0, warning_rank_0
 BACKEND_ENV = "MEGATRON_PARAM_GATHER_BACKEND"
 RCCL_SDMA_BACKEND = "rccl_sdma"
 _EAGER_RUNTIME_INITIALIZED = False
+_EAGER_INITIALIZED_GROUPS: set[tuple[object, int]] = set()
 
 # Keep the real allocator available when another __init__ wrapper temporarily
 # patches torch.zeros around this one. In particular, the direct-gradient
@@ -209,11 +210,62 @@ def make_param_and_grad_buffer_init(original):
     return wrapped
 
 
+def _registered_nccl_groups():
+    """Return this rank's NCCL groups in global group-creation order.
+
+    There is no public API to enumerate groups. The c10d registry preserves
+    creation order; enumerating Megatron getters instead can reorder overlapping
+    groups and omit singleton TP groups. Keep this private-API dependency here
+    and use public APIs for backend and rank queries. Never sort by group name
+    (numeric names sort lexically) or skip size-one groups: their first broadcast
+    still initializes a communicator and allocates RCCL device memory.
+    """
+    import torch.distributed as dist
+
+    registry = getattr(getattr(dist.distributed_c10d, "_world", None), "pg_map", None)
+    if registry is None:
+        raise RuntimeError("RCCL eager initialization requires the c10d process-group registry")
+    seen = set()
+    groups = []
+    for group in (dist.group.WORLD, *tuple(registry)):
+        if group is None or group == dist.GroupMember.NON_GROUP_MEMBER or id(group) in seen:
+            continue
+        seen.add(id(group))
+        if dist.get_rank(group) < 0:
+            continue
+        backend = str(dist.get_backend(group)).lower()
+        nccl_backends = {"nccl", "nccl-lazy", "nccl2"}
+        if backend not in nccl_backends:
+            # A default multi-device group can be reported as "undefined".
+            config = str(dist.get_backend_config(group)).lower()
+            device_backends = dict(item.split(":", 1) for item in config.split(",") if ":" in item)
+            if device_backends.get("cuda") not in nccl_backends:
+                continue
+        ranks = dist.get_process_group_ranks(group)
+        if not ranks:
+            raise RuntimeError("RCCL eager initialization found an empty member process group")
+        groups.append((group, backend, ranks))
+    return groups
+
+
+def _eager_memory_description(device):
+    free, total = torch.cuda.mem_get_info(device)
+    return (
+        f"free_bytes={free} total_bytes={total} "
+        f"allocated_bytes={torch.cuda.memory_allocated(device)} "
+        f"reserved_bytes={torch.cuda.memory_reserved(device)}"
+    )
+
+
 def eager_initialize_runtime() -> bool:
-    """Reserve WORLD and CE cuMem pools before DDP/optimizer allocations."""
+    """Initialize existing NCCL groups and CE before model allocations.
+
+    This changes initialization timing only. In particular, lazy TP1 broadcasts
+    must not first allocate their RCCL cuMem pool after large model/optimizer
+    buffers have been allocated. Synchronize each probe before entering the next group
+    so overlapping communicators use the same creation order on every rank.
+    """
     global _EAGER_RUNTIME_INITIALIZED
-    if _EAGER_RUNTIME_INITIALIZED:
-        return True
 
     import torch
     import torch.distributed as dist
@@ -224,12 +276,74 @@ def eager_initialize_runtime() -> bool:
 
     if not dist.is_initialized():
         return False
+    was_initialized = _EAGER_RUNTIME_INITIALIZED
+    _EAGER_RUNTIME_INITIALIZED = False
     device = torch.device("cuda", torch.cuda.current_device())
-    world_probe = torch.zeros(1, dtype=torch.int32, device=device)
-    dist.broadcast(world_probe, src=0)
-    prepare_direct_param_buffer_pool(dist.group.WORLD, device)
+    groups = _registered_nccl_groups()
+    pending = [entry for entry in groups if (entry[0], device.index) not in _EAGER_INITIALIZED_GROUPS]
+    if was_initialized and not pending:
+        _EAGER_RUNTIME_INITIALIZED = True
+        return True
+    probe = torch.zeros(1, dtype=torch.int32, device=device)
+    for group, backend, ranks in pending:
+        description = (
+            f"rank={dist.get_rank()} name={group.group_name} "
+            f"description={getattr(group, 'group_desc', '')!r} backend={backend} ranks={ranks}"
+        )
+        print(
+            f"[RCCL-SDMA:Megatron] eager communicator begin {description} {_eager_memory_description(device)}",
+            flush=True,
+        )
+        try:
+            dist.broadcast(probe, src=ranks[0], group=group)
+            torch.cuda.synchronize(device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"RCCL eager communicator initialization failed: {description}: {exc}"
+            ) from exc
+        _EAGER_INITIALIZED_GROUPS.add((group, device.index))
+        print(
+            f"[RCCL-SDMA:Megatron] eager communicator complete {description} "
+            f"{_eager_memory_description(device)}",
+            flush=True,
+        )
+    try:
+        group, _pool = prepare_direct_param_buffer_pool(dist.group.WORLD, device)
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        raise RuntimeError(
+            f"RCCL eager CE pool initialization failed: rank={dist.get_rank()} "
+            f"parent_group={dist.group.WORLD.group_name}: {exc}"
+        ) from exc
+    _EAGER_INITIALIZED_GROUPS.add((group, device.index))
     _EAGER_RUNTIME_INITIALIZED = True
     return True
+
+
+def make_eager_initialize_megatron(original_initialize_megatron):
+    """Cover ordinary and deferred initialization, including newly added groups."""
+
+    @functools.wraps(original_initialize_megatron)
+    def wrapped(*args, **kwargs):
+        result = original_initialize_megatron(*args, **kwargs)
+        if callable(result):
+            deferred_initialize = result
+
+            @functools.wraps(deferred_initialize)
+            def wrapped_deferred(*deferred_args, **deferred_kwargs):
+                deferred_result = deferred_initialize(*deferred_args, **deferred_kwargs)
+                if not eager_initialize_runtime():
+                    raise RuntimeError(
+                        "torch.distributed is not initialized after deferred Megatron initialization"
+                    )
+                return deferred_result
+
+            return wrapped_deferred
+        if not eager_initialize_runtime():
+            raise RuntimeError("torch.distributed is not initialized after Megatron initialization")
+        return result
+
+    return wrapped
 
 
 @register_patch(
@@ -315,40 +429,16 @@ def patch_rccl_sdma_param_all_gather(ctx: PatchContext) -> None:
         setattr(param_and_grad_buffer, direct_marker, True)
 
     if os.getenv("MEGATRON_RCCL_SDMA_EAGER_INIT", "0") == "1":
-        if not eager_initialize_runtime():
-            import megatron.training.training as training_module
+        # Even if WORLD was initialized by the caller, Megatron may create more
+        # groups later. Revisit the registry after initialize_megatron returns.
+        eager_initialize_runtime()
+        import megatron.training.training as training_module
 
-            eager_marker = "_primus_rccl_sdma_eager_init_patched"
-            if not getattr(training_module, eager_marker, False):
-                original_initialize_megatron = training_module.initialize_megatron
-
-                @functools.wraps(original_initialize_megatron)
-                def wrapped_initialize_megatron(*args, **kwargs):
-                    result = original_initialize_megatron(*args, **kwargs)
-                    if callable(result):
-                        deferred_initialize = result
-
-                        @functools.wraps(deferred_initialize)
-                        def wrapped_deferred_initialize(*deferred_args, **deferred_kwargs):
-                            deferred_result = deferred_initialize(
-                                *deferred_args,
-                                **deferred_kwargs,
-                            )
-                            if not eager_initialize_runtime():
-                                raise RuntimeError(
-                                    "torch.distributed is not initialized after "
-                                    "deferred Megatron initialization"
-                                )
-                            return deferred_result
-
-                        return wrapped_deferred_initialize
-                    if not eager_initialize_runtime():
-                        raise RuntimeError(
-                            "torch.distributed is not initialized after " "Megatron initialization"
-                        )
-                    return result
-
-                training_module.initialize_megatron = wrapped_initialize_megatron
-                setattr(training_module, eager_marker, True)
+        eager_marker = "_primus_rccl_sdma_eager_init_patched"
+        if not getattr(training_module, eager_marker, False):
+            training_module.initialize_megatron = make_eager_initialize_megatron(
+                training_module.initialize_megatron
+            )
+            setattr(training_module, eager_marker, True)
 
     log_rank_0("[Patch:megatron.distributed.rccl_sdma_param_all_gather] installed")
