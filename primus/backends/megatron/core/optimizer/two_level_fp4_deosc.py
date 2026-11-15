@@ -152,7 +152,7 @@ class TwoLevelDeOsc:
                     "shape": list(model.shape),
                     "model_dtype": str(model.dtype),
                     "master_dtype": str(master.dtype),
-                    "outer_scope": "complete_parameter",
+                    "outer_scope": "none" if config.outer_scope == "none" else "complete_parameter",
                     "recipe": config.to_dict(),
                     "recipe_fingerprint": config.fingerprint,
                 }

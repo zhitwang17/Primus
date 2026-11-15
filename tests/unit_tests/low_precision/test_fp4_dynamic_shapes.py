@@ -110,13 +110,14 @@ def test_dynamic_indexing_exceeds_int32_without_allocating_large_tensors():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real accelerator required; no GPU emulation")
 @pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
+@pytest.mark.parametrize("outer_scope", ["tensor", "none"])
 @pytest.mark.parametrize("direction,role", [("fwd", "weight"), ("wgrad", "grad_output")])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_device_kernel_dynamic_cache_reuse_and_noncontiguous_exact_parity(recipe, direction, role, dtype):
+def test_device_kernel_dynamic_cache_reuse_and_noncontiguous_exact_parity(recipe, outer_scope, direction, role, dtype):
     from test_fp4_gpu_rng import philox_uniform
 
     assert os.environ.get("TRITON_INTERPRET", "0") == "0"
-    cfg = contract.TwoLevelFP4Config(recipe, quantizer="triton", sr_rng="triton_philox")
+    cfg = contract.TwoLevelFP4Config(recipe, outer_scope=outer_scope, quantizer="triton", sr_rng="triton_philox")
     oracle_cfg = replace(cfg, quantizer="torch", sr_rng="torch_cpu")
     operand = cfg.operand(direction, role)
     cached_keys = None

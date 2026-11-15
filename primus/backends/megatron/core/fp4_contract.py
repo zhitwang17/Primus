@@ -76,8 +76,8 @@ class TwoLevelFP4Config:
             object.__setattr__(self, key, _boolean(getattr(self, key), key))
         if self.block_size != 16 or isinstance(self.block_size, bool):
             raise ValueError("NVFP4/AMDFP4 inner block_size must be 16")
-        if self.outer_scope != "tensor" or self.inner_storage != "float32_grid":
-            raise ValueError("Reference contract supports tensor outer scope and float32_grid inner storage")
+        if self.outer_scope not in ("tensor", "none") or self.inner_storage != "float32_grid":
+            raise ValueError("Reference contract supports tensor/none outer scope and float32_grid inner storage")
         if type(self.rht_size) is not int or self.rht_size not in (0, 16, 32):
             raise ValueError("rht_size must be 0 (disabled), 16, or 32")
         if type(self.rng_seed) is not int or not 0 <= self.rng_seed < 2**63:
@@ -114,11 +114,15 @@ class TwoLevelFP4Config:
 
     @property
     def rng_fingerprint(self):
-        """Kernel/SR selection must not perturb the independent RHT stream."""
+        """Kernel/SR/outer-scale selection must not perturb the random streams."""
         numerical = self.to_dict()
         numerical.pop("quantizer")
         numerical.pop("sr_rng", None)
         numerical.pop("value_checks", None)
+        # Preserve existing tensor-mode stream IDs, while keeping an outer-off
+        # comparison on the same SR/RHT samples. Full recipe/checkpoint identity
+        # still includes the actual outer_scope via fingerprint.
+        numerical["outer_scope"] = "tensor"
         return hashlib.sha256(json.dumps(numerical, sort_keys=True).encode()).hexdigest()
 
     def operand(self, direction, role):
@@ -145,6 +149,8 @@ class TwoLevelFP4Config:
         """Scalar CPU specification. Tensor reductions belong to the backend."""
         if not math.isfinite(tensor_amax) or tensor_amax < 0:
             raise ValueError("tensor_amax must be finite and nonnegative")
+        if self.outer_scope == "none":
+            return 1.0
         return max(tensor_amax / (6.0 * self.inner_max), 1e-30)
 
     def inner_scale(self, block_amax, outer_scale):
@@ -153,6 +159,8 @@ class TwoLevelFP4Config:
             raise ValueError("block_amax must be finite and nonnegative")
         if not math.isfinite(outer_scale) or outer_scale <= 0:
             raise ValueError("outer_scale must be positive and finite")
+        if self.outer_scope == "none" and outer_scale != 1.0:
+            raise ValueError("outer_scope=none requires outer_scale=1")
         value = min(max(block_amax / outer_scale / 6.0, self.inner_floor), self.inner_max)
         bias, last_code = (7, 126) if self.recipe == "nvfp4" else (15, 254)
         grid = [
@@ -282,7 +290,7 @@ class TwoLevelFP4Tensor:
         return tensor.validate()
 
     def validate(self):
-        """Structural validation without a device query or tensor host sync."""
+        """Validate storage; outer-off additionally checks its fixed-one value."""
         packed_shape, scale_shape = self.layout.storage_shapes(self.config)
         for tensor, dtype, shape in (
             (self.data, "torch.uint8", packed_shape),
@@ -293,6 +301,8 @@ class TwoLevelFP4Tensor:
                 raise ValueError(f"FP4 storage requires {dtype} {shape}, got {tensor.dtype} {tensor.shape}")
             if tensor.device != self.data.device or not tensor.is_contiguous():
                 raise ValueError("FP4 storage must be contiguous and on the same device")
+        if self.config.outer_scope == "none" and not bool((self.outer_scale == 1.0).all()):
+            raise ValueError("outer_scope=none requires an FP32 outer_scale fixed at 1")
         return self
 
 

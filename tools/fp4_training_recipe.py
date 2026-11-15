@@ -85,12 +85,24 @@ def build_recipe(
     supplemental_dp4=False,
     supplemental_dp4_prefix=False,
     dp4_3000=False,
+    outer_off_pair=False,
     sr_rng="torch_cpu",
     value_checks="strict",
     comparison_rmsnorm_backend="native",
 ):
     if recipe not in _RECIPES or type(steps) is not int or steps <= 0:
         raise ValueError("Expected mxfp4/nvfp4/amdfp4 and a positive optimizer-update limit")
+    if outer_off_pair and (
+        recipe not in ("nvfp4", "amdfp4")
+        or supplemental_dp4 or supplemental_dp4_prefix or dp4_3000
+        or steps != (8 if admission else 3000) or not recompute
+        or sr_rng != "triton_philox" or value_checks != "grouped_deferred"
+        or comparison_rmsnorm_backend != "torch"
+    ):
+        raise ValueError(
+            "Outer-off pair requires NVFP4/AMDFP4, eight-update admission or 3000-update control, "
+            "full recompute, triton_philox, grouped_deferred and shared Torch RMSNorm"
+        )
     if supplemental_dp4 and (not admission or steps != 8 or not recompute):
         raise ValueError("Supplemental DP4 requires admission, exactly eight updates, and full recompute")
     if supplemental_dp4_prefix and (supplemental_dp4 or admission or steps != 128 or not recompute):
@@ -160,13 +172,15 @@ def build_recipe(
         # pending and the existing MX DeOsc warmup path is outside that wrapper.
         SYNTH_WARMUP_STEPS="0",
     )
-    if supplemental_dp4 or supplemental_dp4_prefix or dp4_3000:
+    if supplemental_dp4 or supplemental_dp4_prefix or dp4_3000 or outer_off_pair:
         environment.update(GPUS_PER_NODE="4", DGXSYSTEM="MI355X_1x4x1")
     original = expand(yaml.safe_load(base.read_text()), environment)
     result = copy.deepcopy(original)
     result.update(
         exp_name=f"fp4_{recipe}_{'admission' if admission else 'control'}_{steps}", workspace=workspace
     )
+    if outer_off_pair:
+        result["exp_name"] = f"fp4_{recipe}_outer_off_{'admission' if admission else 'control'}_{steps}"
     overrides = result["modules"]["pre_trainer"]["overrides"]
     changes = dict(
         fp4_recipe=recipe,
@@ -214,7 +228,7 @@ def build_recipe(
             fp4_quantizer="triton",
             fp4_block_size=16,
             fp4_weight_2d=True,
-            fp4_outer_scope="tensor",
+            fp4_outer_scope="none" if outer_off_pair else "tensor",
             fp4_inner_storage="float32_grid",
             fp4_rht_size=32,
             fp4_rht_randomized=True,
@@ -286,7 +300,7 @@ def build_recipe(
         },
         "environment": environment,
     }
-    if supplemental_dp4 or supplemental_dp4_prefix or dp4_3000:
+    if supplemental_dp4 or supplemental_dp4_prefix or dp4_3000 or outer_off_pair:
         geometry = dict(
             num_layers=24,
             hidden_size=2880,
@@ -332,7 +346,7 @@ def build_recipe(
         manifest["rmsnorm_control"] = (
             "torch FP32 arithmetic in both combined QKV RMSNorm slots; parameter dtype and zero-centered addition preserved"
         )
-    if dp4_3000:
+    if dp4_3000 or (outer_off_pair and not admission):
         required = {
             "weight_deosc_start_step": 768,
             "weight_deosc_period": 100,
@@ -354,6 +368,23 @@ def build_recipe(
             default_dp8_3000_comparison=False,
             comparison_boundary="Full-model DP4 3000-update recipe comparison with GBS32/GAS2; not DP8. Early convergence is separate from completion of 3000 updates. Last scheduled validation is update 2688; one seed does not establish a convergence advantage.",
         )
+    if outer_off_pair:
+        manifest.update(
+            scope="outer_off_dp4_admission" if admission else "outer_off_dp4_3000",
+            comparison_family="nvfp4_amdfp4_outer_off",
+            outer_scale_policy="fixed_one",
+            outer_scale_value=1.0,
+            comparison_recipes=["nvfp4", "amdfp4"],
+            default_dp8_3000_comparison=False,
+            deosc_boundary_difference="Exact sharded tile reconstruction with fixed-one outer scale in both formats",
+            comparison_boundary=(
+                "Matched NVFP4/AMDFP4 DP4 fixed-one outer-scale experiment; all QDQ directions "
+                "and DeOsc use outer=1. "
+                + ("Eight-update early-DeOsc admission, not convergence evidence." if admission else
+                   "3000-update bound retains default schedule and DeOsc768/100; last scheduled validation2688. "
+                   "Historical outer-on comparisons must disclose their different runtime source identity.")
+            ),
+        )
     return result, manifest
 
 
@@ -372,6 +403,7 @@ def main():
     supplemental.add_argument("--supplemental-dp4", action="store_true")
     supplemental.add_argument("--supplemental-dp4-prefix", action="store_true")
     supplemental.add_argument("--dp4-3000", action="store_true")
+    supplemental.add_argument("--outer-off-pair", action="store_true")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
@@ -388,6 +420,7 @@ def main():
         supplemental_dp4=args.supplemental_dp4,
         supplemental_dp4_prefix=args.supplemental_dp4_prefix,
         dp4_3000=args.dp4_3000,
+        outer_off_pair=args.outer_off_pair,
         sr_rng=args.sr_rng,
         value_checks=args.value_checks,
         comparison_rmsnorm_backend=args.comparison_rmsnorm_backend,

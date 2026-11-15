@@ -104,9 +104,12 @@ def _validate_input_kernel(
 
 
 @triton.jit
-def _validate_outer_kernel(OUTER, ERROR):
+def _validate_outer_kernel(OUTER, ERROR, UNIT: tl.constexpr = False):
     outer = tl.load(OUTER)
-    if ~((outer > 0.0) & (outer < float("inf"))):
+    valid = (outer > 0.0) & (outer < float("inf"))
+    if UNIT:
+        valid = valid & (outer == 1.0)
+    if ~valid:
         tl.atomic_or(ERROR + 1, 1)
 
 
@@ -410,13 +413,21 @@ def _validation_flags(validation, x, check_values):
 
 @torch.no_grad()
 def compute_outer_scale(x, config, *, check_values=True, validation=None):
-    """Whole-tensor outer amax with bounded-size recursive Triton reductions."""
+    """Whole-tensor outer amax, or fixed FP32 one with preserved finite checks."""
     _input(x)
     error = (
         _validation_flags(validation, x, check_values)
         if validation is not None
         else torch.zeros(1, device=x.device, dtype=torch.int32)
     )
+    if config.outer_scope == "none":
+        # Outer-off skips the amax reductions, not the input validity contract.
+        if check_values and x.numel():
+            (_, r, c), strides = _shape_stride(x)
+            _validate_input_kernel[(triton.cdiv(x.numel(), 4096),)](x, error, x.numel(), r, c, *strides, 4096)
+            if validation is None and error.item():
+                raise ValueError("Triton FP4 rejects non-finite input")
+        return torch.ones(1, device=x.device, dtype=torch.float32)
     if not x.numel():
         return torch.full((1,), 1e-30, device=x.device, dtype=torch.float32)
     (_, r, c), (sb, sr, sc) = _shape_stride(x)
@@ -458,6 +469,14 @@ def _prepare(x, config, operand, outer_scale, random, check_values, validation=N
                 raise ValueError("Triton FP4 rejects non-finite input")
             if not bool((torch.isfinite(outer_scale) & (outer_scale > 0)).all()):
                 raise ValueError("outer_scale must be positive and finite")
+        if config.outer_scope == "none":
+            # A supplied scale must not change the format even when profiling
+            # disables finite checks. Grouped mode records the error without
+            # adding a host synchronization for every expert.
+            if validation is not None:
+                _validate_outer_kernel[(1,)](outer_scale, validation.flags, UNIT=True)
+            elif not bool((outer_scale == 1.0).all()):
+                raise ValueError("outer_scope=none requires outer_scale=1")
     outer = outer_scale.detach().clone().contiguous()
     if validation is not None and not x.numel():
         # Empty QDQ has no data kernel, but its explicit outer must still be

@@ -37,13 +37,29 @@ Existing norm/attention/router/CE choices are retained by the provider, except
 the TE combined norm-linear slot executes a separate Torch norm followed by the
 reference GEMM. Embeddings and the LM head remain outside transformer FP4 scopes.
 
-A grouped weight `[E,N,K]` has one outer scalar across the local expert bank.
+With the default `fp4_outer_scope: tensor`, a grouped weight `[E,N,K]` has one outer scalar across the local expert bank.
 Routed activation/gradient buffers likewise share their outer statistic; each
 expert is padded separately before token-axis RHT/quantization. Cropping happens
 after the product. Empty experts produce explicit zero weight gradients.
 Quantized weight gradients return through ordinary autograd, so Megatron DDP
 accumulates `main_grad` and fires readiness hooks. This does not implement
 Turbo's direct fused FP32 wgrad accumulation/ownership optimization.
+
+The explicit QDQ option `fp4_outer_scope: none` fixes the outer scale to a
+contiguous FP32 `[1]` tensor containing exactly `1.0`, including empty inputs.
+Both NVFP4 and AMDFP4 retain their block16 inner scale formats, rounding,
+padding, gradient SR and RHT. All forward, dgrad and wgrad operands use this
+policy; supplied outer scales other than one are rejected. Triton skips the
+outer amax reductions while preserving strict/deferred finite-input checks.
+The native TE route rejects this option rather than ignoring its scale policy.
+
+Full and optimizer-sharded DeOsc use the same fixed-one QDQ. Sharded execution
+still performs collective nonfinite rejection and exchanges complete boundary
+tiles, including when a rank owns no elements. The recipe and checkpoint
+fingerprints distinguish `none` from `tensor`, so their states cannot be
+silently interchanged. For fresh paired experiments, the same seed, rank and
+module name retain the same SR/RHT stream keys and reservation order across
+the two outer modes. Existing tensor-mode fingerprints and streams are unchanged.
 
 Initialization follows the pinned TE/Turbo BF16 parameter protocol: each expert
 weight is initialized separately in its parameter dtype, under its own expert

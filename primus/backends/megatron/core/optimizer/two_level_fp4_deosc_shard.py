@@ -6,7 +6,8 @@
 The model parameter is replicated, but only its shape is used: its values are
 stale at the pre-copy optimizer boundary. All quantization statistics come from
 the updated master shards after BF16 rounding. One MAX reduction provides the
-whole-parameter (whole expert-bank) outer scale. Only tile-row stripes crossed
+whole-parameter (whole expert-bank) outer scale in tensor mode. Outer-off keeps
+the collective nonfinite check and uses FP32 one on every shard. Only tile-row stripes crossed
 by shard boundaries are exchanged; interiors remain local. Each exchanged
 element has exactly one owner, so SUM is an exact reconstruction, including for
 BF16. No zero-filled boundary approximation or complete-weight all-gather is
@@ -74,15 +75,27 @@ class _ShardQDQPlan:
         # MAX over BF16 values has the same numerical maximum as the forward
         # FP32 reduction of BF16 inputs. The invalid flag makes NaN rejection
         # collective rather than leaving another rank inside a reduction.
-        local_amax = (
-            current.abs().amax().float() if current.numel() else current.new_zeros((), dtype=torch.float32)
-        )
-        summary = torch.stack((local_amax.nan_to_num(), (~torch.isfinite(local_amax)).float()))
+        if binding.config.outer_scope == "none":
+            # There is no parameter/shard outer statistic in this mode. Keep
+            # collective nonfinite rejection so peers cannot enter boundary
+            # exchanges after another rank has failed validation.
+            summary = torch.stack(
+                (current.new_zeros((), dtype=torch.float32), (~torch.isfinite(current)).any().float())
+            )
+        else:
+            local_amax = (
+                current.abs().amax().float() if current.numel() else current.new_zeros((), dtype=torch.float32)
+            )
+            summary = torch.stack((local_amax.nan_to_num(), (~torch.isfinite(local_amax)).float()))
         if world_size > 1:
             dist.all_reduce(summary, op=dist.ReduceOp.MAX, group=process_group)
         if bool(summary[1]):
             raise ValueError("Sharded FP4 DeOsc rejects nonfinite BF16-rounded master values")
-        outer = (summary[:1] / (6.0 * binding.config.inner_max)).clamp_min(1e-30)
+        outer = (
+            torch.ones(1, device=current.device, dtype=torch.float32)
+            if binding.config.outer_scope == "none"
+            else (summary[:1] / (6.0 * binding.config.inner_max)).clamp_min(1e-30)
+        )
 
         boundary = current.new_zeros((len(self.stripes), self.height, self.cols))
         for index, (expert, row) in enumerate(self.stripes):

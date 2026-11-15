@@ -44,6 +44,70 @@ def rng_position(rng):
     return rng.seed, rng.stream_id, rng.sr_offset, rng.rht_offset
 
 
+@pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
+@pytest.mark.parametrize("weight_2d", [False, True])
+def test_outer_off_triton_matches_reference_all_directions(recipe, weight_2d, monkeypatch):
+    cfg = C.TwoLevelFP4Config(
+        recipe,
+        outer_scope="none",
+        quantizer="triton",
+        weight_2d=weight_2d,
+        rht_size=0,
+        gradient_sr=False,
+    )
+
+    def no_outer_amax(*args, **kwargs):
+        raise AssertionError("outer-off must not launch the outer amax reduction")
+
+    monkeypatch.setattr(T, "_amax_input", no_outer_amax)
+    for rows in (0, 17):
+        x = tensor(rows)
+        assert torch.equal(T.compute_outer_scale(x, cfg), torch.ones(1, device=DEVICE))
+        for direction, role in (
+            ("fwd", "input"),
+            ("fwd", "weight"),
+            ("dgrad", "grad_output"),
+            ("dgrad", "weight"),
+            ("wgrad", "input"),
+            ("wgrad", "grad_output"),
+        ):
+            operand = cfg.operand(direction, role)
+            expected, actual = R.quantize(x, cfg, operand), T.quantize(x, cfg, operand)
+            for field in ("data", "inner_scale", "outer_scale"):
+                assert torch.equal(getattr(actual, field), getattr(expected, field))
+            assert torch.equal(T.qdq(x, cfg, operand), R.qdq(x, cfg, operand))
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
+@pytest.mark.parametrize("rows", [0, 17])
+def test_outer_off_supplied_scale_cannot_override_unit_policy(recipe, rows):
+    cfg = C.TwoLevelFP4Config(recipe, outer_scope="none", quantizer="triton")
+    x = tensor(rows)
+    outer = torch.tensor([2.0], dtype=torch.float32, device=DEVICE)
+    for check_values in (True, False):
+        with pytest.raises(ValueError, match="outer_scope=none"):
+            T.qdq(x, cfg, cfg.operand("fwd", "input"), outer_scale=outer, check_values=check_values)
+    with pytest.raises(ValueError, match="outer scale"):
+        with T.DeferredValueChecks(DEVICE) as validation:
+            T.qdq(x, cfg, cfg.operand("fwd", "input"), outer_scale=outer, validation=validation)
+            assert validation.flags[1].item() == 1
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
+def test_outer_off_retains_strict_and_deferred_nonfinite_checks(recipe):
+    cfg = C.TwoLevelFP4Config(recipe, outer_scope="none", quantizer="triton")
+    x = tensor()
+    x[0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite input"):
+        T.compute_outer_scale(x, cfg)
+    with pytest.raises(ValueError, match="non-finite input"):
+        with T.DeferredValueChecks(DEVICE) as validation:
+            assert torch.equal(
+                T.compute_outer_scale(x, cfg, validation=validation), torch.ones(1, device=DEVICE)
+            )
+            assert validation.flags[0].item() == 1
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
 @pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
 def test_amax_sanitization_cannot_erase_nonfinite_evidence(recipe, bad):

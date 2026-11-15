@@ -24,7 +24,7 @@ def _equal(a, b, label):
         raise AssertionError(f"{label}: sign mismatch (including signed zero)")
 
 
-def run(quick=False, gemm=False):
+def run(quick=False, gemm=False, outer_scope="tensor"):
     if not torch.cuda.is_available():
         raise RuntimeError("A GPU is required for Triton parity")
     C, _ = load_contracts()
@@ -61,7 +61,7 @@ def run(quick=False, gemm=False):
         ("wgrad", "grad_output"),
     ]
     for recipe in ("nvfp4", "amdfp4"):
-        cfg = C.TwoLevelFP4Config(recipe)
+        cfg = C.TwoLevelFP4Config(recipe, outer_scope=outer_scope)
         for dtype in (torch.float32, torch.bfloat16):
             for shape in [(17, 33)] if quick else [(17, 33), (2, 17, 33)]:
                 x = torch.sin(torch.arange(torch.tensor(shape).prod().item(), dtype=torch.float32) / 3)
@@ -70,7 +70,7 @@ def run(quick=False, gemm=False):
                     check(
                         x, cfg, cfg.operand(direction, role), f"{recipe}/{dtype}/{shape}/{direction}/{role}"
                     )
-        deterministic = C.TwoLevelFP4Config(recipe, gradient_sr=False, rht_size=0)
+        deterministic = C.TwoLevelFP4Config(recipe, outer_scope=outer_scope, gradient_sr=False, rht_size=0)
         one = torch.ones(1, device="cuda", dtype=torch.float32)
         values = torch.tensor(
             [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], device="cuda"
@@ -121,6 +121,7 @@ def run(quick=False, gemm=False):
             raise AssertionError("Underflowed combined scale was accepted")
     result = {
         "status": "passed",
+        "outer_scope": outer_scope,
         "torch": str(torch.__version__),
         "device": torch.cuda.get_device_name(),
         "cases": rows,
@@ -136,7 +137,7 @@ def run(quick=False, gemm=False):
         generator = torch.Generator(device="cpu").manual_seed(917)
         for recipe in ("nvfp4", "amdfp4"):
             for two_d in (False, True):
-                cfg = C.TwoLevelFP4Config(recipe, weight_2d=two_d, rht_size=0, gradient_sr=False)
+                cfg = C.TwoLevelFP4Config(recipe, outer_scope=outer_scope, weight_2d=two_d, rht_size=0, gradient_sr=False)
                 for m, n, k in shapes:
                     a = torch.randn((m, k), generator=generator).cuda().bfloat16()
                     b = torch.randn((n, k), generator=generator).cuda().bfloat16()
@@ -170,13 +171,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--outer-scope", choices=("tensor", "none"), default="tensor")
     parser.add_argument(
         "--gemm", action="store_true", help="Also validate the experimental packed-scale GEMM"
     )
     args = parser.parse_args()
     result = {"status": "failed"}
     try:
-        result = run(args.quick, args.gemm)
+        result = run(args.quick, args.gemm, args.outer_scope)
     except Exception:
         result["traceback"] = traceback.format_exc()
         raise

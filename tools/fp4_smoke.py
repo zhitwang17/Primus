@@ -107,6 +107,7 @@ def parse_args(argv=None):
     parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
+    parser.add_argument("--outer-scope", choices=("tensor", "none"), default="tensor")
     parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
     parser.add_argument("--checkpoint-format", choices=("bundle", "torch_dist"), default="bundle")
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
@@ -213,6 +214,7 @@ def _make_config(args):
     config.fp4_quantizer = args.quantizer
     config.fp4_sr_rng = args.sr_rng
     config.fp4_value_checks = args.value_checks
+    config.fp4_outer_scope = args.outer_scope
     config.fp4_comparison_rmsnorm_backend = args.comparison_rmsnorm_backend
     config.use_distributed_optimizer = args.distributed_optimizer
     config.weight_deosc = args.deosc

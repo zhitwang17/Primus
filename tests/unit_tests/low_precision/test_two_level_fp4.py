@@ -76,6 +76,7 @@ def test_recipe_fragment_and_routes(recipe, inner, maximum, floor):
         {"turbo_fused_grouped_gemm": True},
         {"fp4_quantizer": "unsupported"},
         {"fp4_backend": "te", "fp4_quantizer": "triton"},
+        {"fp4_backend": "te", "fp4_outer_scope": "none", "use_turbo_gemm": False},
         {"fp4_backend": "auto", "fp4_quantizer": "triton"},
         {"weight_deosc_direct_qdq": True},
         {"moe_permute_quant_fusion": True},

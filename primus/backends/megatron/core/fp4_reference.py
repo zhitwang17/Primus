@@ -71,11 +71,14 @@ def _generator(random, stream, words):
 def compute_outer_scale(x, config):
     """Return one FP32 scale for the entire supplied tensor, including a bank.
 
-    Empty tensors use the same floor as an all-zero tensor. The reference
+    With outer_scope=none, every input (including empty tensors) uses FP32 one.
+    Tensor-scope empty tensors use the same floor as an all-zero tensor. The reference
     rejects NaN/Inf rather than silently sanitizing them; this is intentionally
     stricter than ALTO's non-finite amax policy.
     """
     _check_input(x)
+    if config.outer_scope == "none":
+        return torch.ones(1, device=x.device, dtype=torch.float32)
     amax = x.float().abs().amax() if x.numel() else x.new_zeros((), dtype=torch.float32)
     return (amax / (6.0 * config.inner_max)).clamp_min(1e-30).reshape(1).contiguous()
 
@@ -136,6 +139,8 @@ def quantize(x, config, operand, *, outer_scale=None, random=None):
         or not bool((torch.isfinite(outer_scale) & (outer_scale > 0)).all())
     ):
         raise ValueError("outer_scale must be a positive finite FP32 [1] tensor on the input device")
+    if config.outer_scope == "none" and not bool((outer_scale == 1.0).all()):
+        raise ValueError("outer_scope=none requires outer_scale=1")
     outer_scale = outer_scale.detach().clone().contiguous()
 
     axis = operand.axis % x.ndim

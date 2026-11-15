@@ -18,7 +18,7 @@ SMOKE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SMOKE)
 
 
-def make_config(monkeypatch, recipe, backend):
+def make_config(monkeypatch, recipe, backend, outer_scope="tensor"):
     for name, members in (
         ("megatron.core.transformer.enums", {"AttnBackend": SimpleNamespace(unfused="unfused")}),
         ("megatron.core.transformer.transformer_config", {"TransformerConfig": SimpleNamespace}),
@@ -28,7 +28,8 @@ def make_config(monkeypatch, recipe, backend):
         module.__dict__.update(members)
         monkeypatch.setitem(sys.modules, name, module)
     args = SMOKE.parse_args(
-        ["--recipe", recipe, "--output", "/tmp/unused.json", "--comparison-rmsnorm-backend", backend]
+        ["--recipe", recipe, "--output", "/tmp/unused.json", "--comparison-rmsnorm-backend", backend,
+         "--outer-scope", outer_scope]
     )
     return SMOKE._make_config(args)
 
@@ -61,6 +62,17 @@ def make_model(modules, monkeypatch, config):
 
 def execute_norms(model, x):
     return [module(x)[0] for module in model.modules() if hasattr(module, "fp4_comparison_rmsnorm_backend")]
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])
+@pytest.mark.parametrize("scope", ["tensor", "none"])
+def test_outer_scope_reaches_actual_smoke_module_configs(modules, monkeypatch, recipe, scope):
+    config = make_config(monkeypatch, recipe, "torch", scope)
+    model = make_model(modules, monkeypatch, config)
+    configs = [module.fp4_config for module in model.modules() if hasattr(module, "fp4_config")]
+    assert configs and all(cfg.outer_scope == scope for cfg in configs)
+    if scope == "none":
+        assert all(cfg.outer_scale(17.0) == 1.0 for cfg in configs)
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "amdfp4"])

@@ -135,6 +135,8 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
     if option(config, "transformer_impl", "transformer_engine", fallback) != "transformer_engine":
         raise ValueError("Two-level FP4 routing requires transformer_impl=transformer_engine")
     if backend == "te":
+        if recipe.outer_scope != "tensor":
+            raise ValueError("fp4_outer_scope=none requires fp4_backend=reference; TE owns its scale policy")
         if recipe.quantizer != "torch":
             raise ValueError("fp4_quantizer=triton requires fp4_backend=reference; TE owns its quantizer")
         if recipe.recipe != "nvfp4":
