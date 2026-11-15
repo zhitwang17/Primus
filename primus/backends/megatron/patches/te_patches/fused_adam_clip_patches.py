@@ -24,8 +24,11 @@ optimizer no longer drains the GPU pipeline through ``Tensor.item()``.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import math
 import os
+import tempfile
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -125,6 +128,46 @@ def _get_grad_norm_tensor(optimizer) -> torch.Tensor:
     return total_norm_squared.sqrt()
 
 
+def _cached_extension_source(source: Path) -> tuple[str, Path, Path]:
+    """Stage identical CUDA bytes where ROCm hipify may write its .hip output.
+
+    Training sources can be a read-only commit archive. PyTorch hipify writes
+    next to an out-of-tree input, so passing that archive's .cu path can silently
+    leave CUDA headers untranslated. Keep both input and generated files inside
+    PyTorch's writable build cache instead. A content-specific module/build name
+    also prevents a different source revision from reusing a stale library.
+    """
+    from torch.utils.cpp_extension import _get_build_directory
+
+    content = source.read_bytes()
+    name = f"{_EXTENSION_NAME}_{hashlib.sha256(content).hexdigest()}"
+    directory = Path(_get_build_directory(name, verbose=False)).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    staged = directory / source.name
+    # This separate OS lock protects staging across ranks without colliding
+    # with the build lock held internally by torch.utils.cpp_extension.load.
+    with (directory / "source.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if staged.exists():
+            if staged.read_bytes() != content:
+                raise RuntimeError(f"Cached fused Adam source differs from its content address: {staged}")
+        else:
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=directory, prefix="source-", suffix=".tmp", delete=False
+                ) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, staged)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+    return name, staged, directory
+
+
 def _load_extension():
     global _extension
     if _extension is not None:
@@ -133,10 +176,12 @@ def _load_extension():
     from torch.utils.cpp_extension import load
 
     source = Path(__file__).with_name("fused_adam_clip_kernel.cu")
+    name, staged, directory = _cached_extension_source(source)
     # No -std flag: torch adds the one its headers need, and torch 2.14's need C++20.
     _extension = load(
-        name=_EXTENSION_NAME,
-        sources=[str(source)],
+        name=name,
+        sources=[str(staged)],
+        build_directory=str(directory),
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
         with_cuda=True,
