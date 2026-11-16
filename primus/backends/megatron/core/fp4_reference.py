@@ -242,6 +242,12 @@ def rht_pair(x, dy, config, *, random=None, validation=None):
     product breaks orthogonal cancellation. Inputs are transformed in FP32
     and returned in their original dtype, matching the intended BF16 operand
     boundary. H32 is the default; H16/disabled are distinct recipe settings.
+    ``rht_size=16, rht_randomized=False`` is deterministic H16x2 on each
+    contiguous 32-token interval: two independent H16 transforms, normalized
+    by 1/4, with no mixing between the halves. Unlike Turbo's fused native
+    producer, this QDQ route rounds the FP32 transform back to the input
+    dtype before FP4 quantization. The geometry agrees; this boundary remains
+    a distinct numerical property of the reference compute route.
     Randomized H uses row signs and a shared row/column permutation, freshly
     selected for this pair. Empty input and disabled RHT consume no RNG.
     """

@@ -1,6 +1,9 @@
 # Merge this option fragment into a fresh FP4 experiment; it is not a launcher.
-# Keep the selected fp4_recipe and its existing RHT geometry (NV/AMD H32, MX H16).
+# Deterministic H16x2: two independent H16 transforms per 32 values.
+# Native MX already uses H16; these two fields select it in the NV/AMD route.
 # These options do not resume any previously stopped campaign.
+fp4_rht_size: 16
+fp4_rht_randomized: false
 weight_deosc_shard_boundary_mode: zero_fill
 fp4_gradient_rounding_policy: shared_philox
 

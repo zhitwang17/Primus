@@ -285,6 +285,32 @@ The mergeable `examples/megatron/low_precision/two_level_fp4/recipe_alignment.ya
 fragment lists the common settings. Native MX consumers still require their
 Turbo GEMM route flags; the two-level reference consumers keep their own routes.
 
+### Deterministic H16x2 comparison preparation
+
+The updated alignment fragment explicitly sets `fp4_rht_size: 16` and
+`fp4_rht_randomized: false`. Two independent normalized H16 transforms within
+each 32-value interval are the H16x2 transform used by native MXFP4; this is not
+two successive H16 applications or an H32 transform. Reference grouped operands
+pad each expert independently. Both routes apply this paired transform along the
+wgrad token-reduction axis. No random signs, permutation or RHT RNG consumption
+is involved. Existing defaults and frozen H32 experiment recipes remain intact;
+an old H32 checkpoint cannot be loaded as this new H16 recipe.
+
+This aligns the transform geometry, not every arithmetic boundary. Reference
+NVFP4/AMDFP4 compute the transform in FP32 and cast back to the BF16 operand dtype
+before FP4 QDQ; native MXFP4 quantizes the FP32 butterfly result directly. MX
+caches the transformed activation during forward, whereas the reference route
+transforms the paired activation and gradient during backward. Block/scale
+geometry, tensor outer scale and random-stream layout remain format-specific.
+
+CPU checks cover independent H16 butterflies, tails, orthogonal pair
+cancellation, expert isolation, deterministic/private RNG behavior, dense and
+grouped autograd, the BF16 intermediate and checkpoint identity. They do not
+qualify the new three-way full-model training configuration on a GPU. The
+knowledge-base `scripts/fp4_rht16x2_compare_20261116/` preparation tools produce
+separate DP8 admissions and 3K controls, retain BF16 Adam and the default full
+learning-rate horizon, and do not register or launch a training queue by default.
+
 ### November 16 recipe-gap verification
 
 The low-precision CPU suite passed **583 tests**, with **38 device-dependent
