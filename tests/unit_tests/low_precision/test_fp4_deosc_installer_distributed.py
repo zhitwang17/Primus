@@ -144,6 +144,7 @@ def _installer_worker(rank, rendezvous):
                         weight_deosc_period=1,
                         weight_deosc_ratio=4,
                         weight_deosc_accumulator_dtype=accumulator_dtype,
+                        weight_deosc_shard_boundary_mode="exact",
                         data_parallel_size=3,
                         use_distributed_optimizer=True,
                     )
@@ -213,6 +214,7 @@ def _installer_worker(rank, rendezvous):
                 weight_deosc_period=1,
                 weight_deosc_ratio=4,
                 weight_deosc_accumulator_dtype="bf16",
+                weight_deosc_shard_boundary_mode="exact",
                 data_parallel_size=3,
                 use_distributed_optimizer=True,
             )
@@ -233,6 +235,22 @@ def _installer_worker(rank, rendezvous):
             snapped = torch.tensor(sum(runner.stats["snapped"] for runner in runners))
             dist.all_reduce(snapped)
             assert snapped.item() == 3
+
+        # New training installs default to zero-fill, while explicit exact mode
+        # remains available for prior checkpoints and controlled comparisons.
+        for boundary_mode in (None, "zero_fill", "exact"):
+            model = torch.nn.Module()
+            model.layers = torch.nn.ModuleList(
+                Layer("nvfp4", rank, i, shape) for i, shape in enumerate(((17, 19), (3, 17, 19), (1, 16)))
+            )
+            optimizer = BucketOptimizer(model, rank, False)
+            mode_args = SimpleNamespace(weight_deosc=True, use_distributed_optimizer=True)
+            if boundary_mode is not None:
+                mode_args.weight_deosc_shard_boundary_mode = boundary_mode
+            runner = D.install_megatron_deosc(optimizer, [model], mode_args)[0]
+            assert runner.boundary_mode == (boundary_mode or "zero_fill")
+            assert all(plan.boundary_mode == runner.boundary_mode for plan in runner._plans.values())
+            dist.barrier()
 
         # Bad metadata on only one owner must reject on every rank without
         # leaving its peers blocked inside the collective runner constructor.

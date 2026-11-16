@@ -66,6 +66,13 @@ def is_two_level(config):
     return _name(option(config, "fp4_recipe")) in ("nvfp4", "amdfp4")
 
 
+def gradient_rounding_policy(config, fallback=None):
+    policy = option(config, "fp4_gradient_rounding_policy", "recipe", fallback)
+    if policy not in ("recipe", "shared_philox"):
+        raise ValueError("fp4_gradient_rounding_policy must be recipe or shared_philox")
+    return policy
+
+
 def build_two_level_config(config, fallback=None):
     fields = {
         "block_size": ("fp4_block_size", 16),
@@ -80,10 +87,17 @@ def build_two_level_config(config, fallback=None):
         "sr_rng": ("fp4_sr_rng", "torch_cpu"),
         "value_checks": ("fp4_value_checks", "strict"),
     }
-    return TwoLevelFP4Config(
+    result = TwoLevelFP4Config(
         recipe=_name(option(config, "fp4_recipe", fallback=fallback)),
         **{field: option(config, key, default, fallback) for field, (key, default) in fields.items()},
     )
+    if gradient_rounding_policy(config, fallback) == "shared_philox":
+        if not result.gradient_sr or result.quantizer != "triton" or result.sr_rng != "triton_philox":
+            raise ValueError(
+                "shared_philox requires fp4_gradient_sr=true, fp4_quantizer=triton "
+                "and fp4_sr_rng=triton_philox for NVFP4/AMDFP4"
+            )
+    return result
 
 
 @dataclass(frozen=True)

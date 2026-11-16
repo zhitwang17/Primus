@@ -7,15 +7,16 @@ The detector retains Primus' BF16 snapshot/delta policy and defaults to FP32
 distance accumulators. Explicit BF16 accumulation reproduces ALTO's distance
 policy. Its QDQ is the *forward* two-level weight QDQ, including BF16
 pre-rounding, block16/16x16 and whole expert-bank outer scale. There is no
-MXFP4 import, boundary-shard approximation, stochastic rounding or RNG use.
+MXFP4 import, stochastic rounding or RNG use. Sharded execution can approximate
+unavailable boundary weights with zeros, or exchange them for exact QDQ.
 
 Call ``step`` after a successful optimizer update and before master-to-model
 copy. At a period boundary the master is snapped to current BF16 QDQ centers;
 then QDQ is recomputed over the entire weight because its dynamic scale may
 change. A checkpoint records the numerical recipe and snapshot policy as well
 as each observation window. Replicated masters use ``TwoLevelDeOsc``;
-DistributedOptimizer shards use the exact collective implementation in
-``two_level_fp4_deosc_shard``. Neither path approximates boundary blocks.
+DistributedOptimizer shards use the selectable boundary policy in
+``two_level_fp4_deosc_shard``; replicated masters keep exact full-weight QDQ.
 """
 
 from __future__ import annotations
@@ -597,7 +598,11 @@ def install_megatron_deosc(optimizer, models, args):
                 raise ValueError("FP4 parameter appears in multiple distributed optimizers")
             matched.update(membership)
             runner = ShardedTwoLevelDeOsc(
-                shard_bindings, process_group=group, active_modules=owners, **options
+                shard_bindings,
+                process_group=group,
+                active_modules=owners,
+                boundary_mode=_get(args, "weight_deosc_shard_boundary_mode", "zero_fill"),
+                **options,
             )
             if getattr(opt, "is_stub_optimizer", False):
                 raise ValueError("DeOsc cannot run on a stub optimizer")

@@ -116,6 +116,7 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
+    parser.add_argument("--gradient-rounding-policy", choices=("recipe", "shared_philox"), default="recipe")
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     parser.add_argument("--outer-scope", choices=("tensor", "none"), default="tensor")
     parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
@@ -133,6 +134,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--deosc-accumulator-dtype", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--deosc-shard-boundary-mode", choices=("zero_fill", "exact"), default="zero_fill")
     parser.add_argument(
         "--deterministic",
         action="store_true",
@@ -171,6 +173,10 @@ def parse_args(argv=None):
         )
     if args.sr_rng == "triton_philox" and args.quantizer != "triton":
         parser.error("triton_philox SR requires --quantizer triton")
+    if args.gradient_rounding_policy == "shared_philox" and (
+        args.quantizer != "triton" or args.sr_rng != "triton_philox"
+    ):
+        parser.error("shared_philox requires --quantizer triton --sr-rng triton_philox")
     if args.value_checks == "grouped_deferred" and args.quantizer != "triton":
         parser.error("grouped_deferred value checks require --quantizer triton")
     return args
@@ -287,12 +293,14 @@ def _make_config(args):
     config.fp4_rng_seed = args.seed
     config.fp4_quantizer = args.quantizer
     config.fp4_sr_rng = args.sr_rng
+    config.fp4_gradient_rounding_policy = args.gradient_rounding_policy
     config.fp4_value_checks = args.value_checks
     config.fp4_outer_scope = args.outer_scope
     config.fp4_comparison_rmsnorm_backend = args.comparison_rmsnorm_backend
     config.use_distributed_optimizer = args.distributed_optimizer
     config.weight_deosc = args.deosc
     config.weight_deosc_accumulator_dtype = args.deosc_accumulator_dtype
+    config.weight_deosc_shard_boundary_mode = args.deosc_shard_boundary_mode
     config.enable_primus_turbo = False
     config.use_turbo_gemm = False
     config.use_turbo_grouped_gemm = False
@@ -570,6 +578,7 @@ def _build_training_objects(args, config):
                 data_parallel_size=dist.get_world_size(),
                 use_distributed_optimizer=args.distributed_optimizer,
                 weight_deosc_accumulator_dtype=args.deosc_accumulator_dtype,
+                weight_deosc_shard_boundary_mode=args.deosc_shard_boundary_mode,
             ),
         )
         if not runners:

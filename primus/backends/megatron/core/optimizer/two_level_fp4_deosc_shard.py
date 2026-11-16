@@ -1,17 +1,19 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""Exact two-level FP4 DeOsc over contiguous optimizer master shards.
+"""Two-level FP4 DeOsc over contiguous optimizer master shards.
 
 The model parameter is replicated, but only its shape is used: its values are
 stale at the pre-copy optimizer boundary. All quantization statistics come from
 the updated master shards after BF16 rounding. One MAX reduction provides the
 whole-parameter (whole expert-bank) outer scale in tensor mode. Outer-off keeps
-the collective nonfinite check and uses FP32 one on every shard. Only tile-row stripes crossed
-by shard boundaries are exchanged; interiors remain local. Each exchanged
-element has exactly one owner, so SUM is an exact reconstruction, including for
-BF16. No zero-filled boundary approximation or complete-weight all-gather is
-used. Persistent snapshots/distances and checkpoint tensors are local shards.
+the collective nonfinite check and uses FP32 one on every shard. The default
+``zero_fill`` mode leaves unavailable boundary weights at zero, as the MXFP4
+DeOsc shard approximation does, without exchanging weight values. ``exact``
+exchanges only tile-row stripes crossed by shard boundaries; SUM reconstructs
+them exactly because every element has one owner. Both modes retain logical
+tile coordinates and the same whole-bank outer scale. Persistent snapshots,
+distances and checkpoint tensors remain local shards.
 """
 
 from __future__ import annotations
@@ -43,15 +45,16 @@ class FP4ShardBinding:
 
 
 class _ShardQDQPlan:
-    def __init__(self, binding, partitions):
+    def __init__(self, binding, partitions, boundary_mode):
         self.binding = binding
+        self.boundary_mode = boundary_mode
         shape = tuple(binding.model.shape)
         self.experts = shape[0] if len(shape) == 3 else 1
         self.rows, self.cols = shape[-2:]
         self.height = 16 if binding.config.weight_2d else 1
         self.expert_size = self.rows * self.cols
         stripes = set()
-        if self.expert_size:
+        if self.expert_size and boundary_mode == "exact":
             total = self.experts * self.expert_size
             for start, end in partitions:
                 if start == end:
@@ -84,7 +87,9 @@ class _ShardQDQPlan:
             )
         else:
             local_amax = (
-                current.abs().amax().float() if current.numel() else current.new_zeros((), dtype=torch.float32)
+                current.abs().amax().float()
+                if current.numel()
+                else current.new_zeros((), dtype=torch.float32)
             )
             summary = torch.stack((local_amax.nan_to_num(), (~torch.isfinite(local_amax)).float()))
         if world_size > 1:
@@ -97,17 +102,19 @@ class _ShardQDQPlan:
             else (summary[:1] / (6.0 * binding.config.inner_max)).clamp_min(1e-30)
         )
 
-        boundary = current.new_zeros((len(self.stripes), self.height, self.cols))
-        for index, (expert, row) in enumerate(self.stripes):
-            base = expert * self.expert_size + row * self.cols
-            stop = base + min(self.height, self.rows - row) * self.cols
-            lo, hi = max(binding.start, base), min(binding.end, stop)
-            if hi > lo:
-                boundary[index].view(-1)[lo - base : hi - base].copy_(
-                    current[lo - binding.start : hi - binding.start]
-                )
-        if self.stripes and world_size > 1:
-            dist.all_reduce(boundary, op=dist.ReduceOp.SUM, group=process_group)
+        boundary = None
+        if self.stripes:
+            boundary = current.new_zeros((len(self.stripes), self.height, self.cols))
+            for index, (expert, row) in enumerate(self.stripes):
+                base = expert * self.expert_size + row * self.cols
+                stop = base + min(self.height, self.rows - row) * self.cols
+                lo, hi = max(binding.start, base), min(binding.end, stop)
+                if hi > lo:
+                    boundary[index].view(-1)[lo - base : hi - base].copy_(
+                        current[lo - binding.start : hi - binding.start]
+                    )
+            if world_size > 1:
+                dist.all_reduce(boundary, op=dist.ReduceOp.SUM, group=process_group)
 
         result = torch.empty_like(current)
         if not current.numel():
@@ -128,6 +135,8 @@ class _ShardQDQPlan:
             slab.view(-1)[lo - slab_base : hi - slab_base].copy_(
                 current[lo - binding.start : hi - binding.start]
             )
+            # In zero_fill mode there are no stripes or weight collectives:
+            # unavailable values in this logically aligned slab stay zero.
             for index, (boundary_expert, row) in enumerate(self.stripes):
                 if boundary_expert == expert and row_start <= row < row_end:
                     height = min(self.height, self.rows - row)
@@ -149,12 +158,13 @@ class _ShardQDQPlan:
 
 
 class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
-    """Same update/window contract as ``TwoLevelDeOsc``, with exact DP QDQ.
+    """Same update/window contract with zero-filled or exact shard boundaries.
 
     Construction is collective, as is each successful ``step``. Local input
     validation errors, inconsistent active masks and invalid partition coverage
     fail on every participant. Checkpoints deliberately require the same group
-    membership and flat partitions: resharding needs an explicit converter.
+    membership, flat partitions and boundary mode: resharding or changing the
+    approximation needs an explicit converter/fresh observation window.
     """
 
     def __init__(
@@ -168,6 +178,7 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
         active_modules=None,
         accumulator_dtype="fp32",
         epsilon=None,
+        boundary_mode="zero_fill",
     ):
         initialized = dist.is_available() and dist.is_initialized()
         if process_group is not None and not initialized:
@@ -181,6 +192,9 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
         # Do not throw on just one rank before peers reach metadata exchange.
         local_error, metadata = None, None
         try:
+            if boundary_mode not in ("zero_fill", "exact"):
+                raise ValueError("weight_deosc_shard_boundary_mode must be zero_fill or exact")
+            self.boundary_mode = boundary_mode
             self.shard_bindings = dict(sorted(dict(bindings).items()))
             if any(not isinstance(item, FP4ShardBinding) for item in self.shard_bindings.values()):
                 raise ValueError("Sharded DeOsc bindings must be FP4ShardBinding objects")
@@ -198,6 +212,7 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
             )
             metadata = {
                 "settings": super()._identity()["settings"],
+                "boundary_mode": self.boundary_mode,
                 "bindings": {
                     key: {
                         "shape": list(item.model.shape),
@@ -224,7 +239,7 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
         all_metadata = [item["metadata"] for item in participants]
         self.partitions = self._validate_partition_metadata(all_metadata)
         self._plans = {
-            id(item.model): _ShardQDQPlan(item, self.partitions[key])
+            id(item.model): _ShardQDQPlan(item, self.partitions[key], self.boundary_mode)
             for key, item in self.shard_bindings.items()
         }
 
@@ -252,6 +267,7 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
         for metadata in all_metadata:
             if (
                 metadata["settings"] != reference["settings"]
+                or metadata["boundary_mode"] != reference["boundary_mode"]
                 or metadata["bindings"].keys() != reference["bindings"].keys()
             ):
                 raise ValueError("Sharded DeOsc ranks disagree on settings or logical parameter keys")
@@ -324,6 +340,12 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
                 "group_ranks": self.group_ranks,
             },
         )
+        # Keep exact-mode v3 identity byte-for-byte compatible with existing
+        # sidecars. The approximation is a distinct schema and cannot silently
+        # inherit an exact-mode observation window (or vice versa).
+        if self.boundary_mode == "zero_fill":
+            identity["version"] = 4
+            identity["settings"]["shard_boundary_mode"] = self.boundary_mode
         for key, item in self.shard_bindings.items():
             identity["bindings"][key].update(
                 shard_interval=[item.start, item.end],

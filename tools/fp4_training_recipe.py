@@ -94,9 +94,13 @@ def build_recipe(
         raise ValueError("Expected mxfp4/nvfp4/amdfp4 and a positive optimizer-update limit")
     if outer_off_pair and (
         recipe not in ("nvfp4", "amdfp4")
-        or supplemental_dp4 or supplemental_dp4_prefix or dp4_3000
-        or steps != (8 if admission else 3000) or not recompute
-        or sr_rng != "triton_philox" or value_checks != "grouped_deferred"
+        or supplemental_dp4
+        or supplemental_dp4_prefix
+        or dp4_3000
+        or steps != (8 if admission else 3000)
+        or not recompute
+        or sr_rng != "triton_philox"
+        or value_checks != "grouped_deferred"
         or comparison_rmsnorm_backend != "torch"
     ):
         raise ValueError(
@@ -218,6 +222,9 @@ def build_recipe(
         weight_deosc_direct_qdq=False,
         weight_deosc_accumulator_dtype="fp32",
         weight_deosc_epsilon=1e-12,
+        # This generator reproduces the historical FP32-Adam common controls.
+        # Pin their exact boundary policy instead of inheriting the new default.
+        weight_deosc_shard_boundary_mode="exact",
         weight_deosc_log_freq=1,
     )
     if comparison_rmsnorm_backend != "native":
@@ -380,9 +387,12 @@ def build_recipe(
             comparison_boundary=(
                 "Matched NVFP4/AMDFP4 DP4 fixed-one outer-scale experiment; all QDQ directions "
                 "and DeOsc use outer=1. "
-                + ("Eight-update early-DeOsc admission, not convergence evidence." if admission else
-                   "3000-update bound retains default schedule and DeOsc768/100; last scheduled validation2688. "
-                   "Historical outer-on comparisons must disclose their different runtime source identity.")
+                + (
+                    "Eight-update early-DeOsc admission, not convergence evidence."
+                    if admission
+                    else "3000-update bound retains default schedule and DeOsc768/100; last scheduled validation2688. "
+                    "Historical outer-on comparisons must disclose their different runtime source identity."
+                )
             ),
         )
     return result, manifest

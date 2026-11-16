@@ -77,6 +77,9 @@ fp4_gradient_sr: true
 fp4_rng_seed: null # defaults to training seed; private SR/RHT counter streams
 fp4_quantizer: torch # torch reference, or opt-in Triton two-level QDQ kernels
 fp4_sr_rng: torch_cpu # legacy CPU bitstream; triton_philox generates SR in GPU QDQ kernels
+# recipe preserves each format's existing implementation. shared_philox opts
+# all FP4 gradient quantizers into Philox4x32-10 + adjacent-E2M1 probability SR.
+fp4_gradient_rounding_policy: recipe # recipe or shared_philox; see two-level-fp4-reference.md
 fp4_value_checks: strict # grouped_deferred checks once before each grouped autograd call returns
 fp4_comparison_rmsnorm_backend: native # explicit torch aligns combined QKV norm only in comparison recipes
 

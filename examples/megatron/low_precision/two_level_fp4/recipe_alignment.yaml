@@ -1,0 +1,27 @@
+# Merge this option fragment into a fresh FP4 experiment; it is not a launcher.
+# Keep the selected fp4_recipe and its existing RHT geometry (NV/AMD H32, MX H16).
+# These options do not resume any previously stopped campaign.
+weight_deosc_shard_boundary_mode: zero_fill
+fp4_gradient_rounding_policy: shared_philox
+
+# Two-level NVFP4/AMDFP4 consumer requirements; ignored by the native MX route.
+fp4_quantizer: triton
+fp4_sr_rng: triton_philox
+fp4_gradient_sr: true
+
+# Native MXFP4 consumer requirement; two-level recipes use fp4_gradient_sr.
+mxfp4_gradient_stochastic_rounding: true
+
+# The shared adapter requires materialized operands through public quantizers.
+# Preserve use_turbo_gemm/use_turbo_grouped_gemm for the selected format:
+# MX requires true; NV/AMD reference consumers retain their existing false flags.
+turbo_fused_gemm: false
+turbo_fused_grouped_gemm: false
+moe_permute_quant_fusion: false
+moe_backward_permute_quant_fusion: false
+use_turbo_mega_moe: false
+use_turbo_deepep: false
+turbo_sync_free_moe_stage: 0
+fp4_use_native_te_autocast: false
+use_te_op_fuser: false
+cuda_graph_impl: null

@@ -137,7 +137,9 @@ def _equivalence_worker(rank, rendezvous):
                         full, bindings, ranges = _inputs(rank, empty_rank, cfg)
                         options = dict(period=3, ratio=4, accumulator_dtype=accumulator_dtype)
                         reference = D.TwoLevelDeOsc(full, **options)
-                        sharded = S.ShardedTwoLevelDeOsc(bindings, process_group=dist.group.WORLD, **options)
+                        sharded = S.ShardedTwoLevelDeOsc(
+                            bindings, process_group=dist.group.WORLD, boundary_mode="exact", **options
+                        )
                         original_models = {key: b.model.clone() for key, b in bindings.items()}
                         rng_before = torch.random.get_rng_state().clone()
                         checkpoint = io.BytesIO()
@@ -178,7 +180,10 @@ def _equivalence_worker(rank, rendezvous):
                             for key, b in bindings.items()
                         }
                         restored = S.ShardedTwoLevelDeOsc(
-                            restored_bindings, process_group=dist.group.WORLD, **options
+                            restored_bindings,
+                            process_group=dist.group.WORLD,
+                            boundary_mode="exact",
+                            **options,
                         )
                         restored.validate_state_dict(saved["deosc"])
                         assert restored.step_count == 0

@@ -308,7 +308,8 @@ def _partition_worker(rank, rendezvous, recipe):
                 shards[key] = S.FP4ShardBinding(model.clone(), master.flatten()[start:end].clone(),
                                                 cfg, start, end)
             ref = D.TwoLevelDeOsc(full, period=2, ratio=4)
-            actual = S.ShardedTwoLevelDeOsc(shards, process_group=dist.group.WORLD, period=2, ratio=4)
+            actual = S.ShardedTwoLevelDeOsc(shards, process_group=dist.group.WORLD, period=2, ratio=4,
+                                          boundary_mode="exact")
             saved = saved_masters = None
             for step, first in enumerate((0.74609375, 0.75390625, 0.74609375, 0.75390625)):
                 for key, (_, master, _) in full.items():
@@ -333,7 +334,7 @@ def _partition_worker(rank, rendezvous, recipe):
             assert ref.stats["snapped"] > 0
             restored_bindings = {key: replace(b, master=saved_masters[key]) for key, b in shards.items()}
             restored = S.ShardedTwoLevelDeOsc(restored_bindings, process_group=dist.group.WORLD,
-                                             period=2, ratio=4)
+                                             period=2, ratio=4, boundary_mode="exact")
             restored.load_state_dict(saved)
             for first in (0.74609375, 0.75390625):
                 for shard in restored_bindings.values():
@@ -345,7 +346,8 @@ def _partition_worker(rank, rendezvous, recipe):
                 assert torch.equal(restored_bindings[key].master, shards[key].master)
             wrong = {key: replace(b, config=replace(cfg, outer_scope="tensor"))
                      for key, b in restored_bindings.items()}
-            wrong_runner = S.ShardedTwoLevelDeOsc(wrong, process_group=dist.group.WORLD, period=2, ratio=4)
+            wrong_runner = S.ShardedTwoLevelDeOsc(wrong, process_group=dist.group.WORLD, period=2, ratio=4,
+                                                boundary_mode="exact")
             with pytest.raises(ValueError):
                 wrong_runner.load_state_dict(saved)
             assert wrong_runner.step_count == 0

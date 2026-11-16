@@ -22,7 +22,7 @@ milestone; its missing-consumer limitation is superseded by this implementation.
 | Dispatch | `patches/two_level_fp4_patches.py`: install the reference spec provider after the general Primus provider; Turbo modules reject new-format metadata |
 | Private state | `core/fp4_state.py`: stable rank/module/recipe RNG identity, strict continuation metadata and atomic per-rank sidecars |
 | DeOsc | `core/optimizer/two_level_fp4_deosc.py`: successful-update observation before master-to-model copy; explicit distance precision |
-| Optimizer-sharded DeOsc | `core/optimizer/two_level_fp4_deosc_shard.py`: exact whole-bank outer and boundary-block QDQ with rank-local masters/history |
+| Optimizer-sharded DeOsc | `core/optimizer/two_level_fp4_deosc_shard.py`: whole-bank outer, local zero-filled boundaries by default, optional exact boundary exchange |
 | Training hooks | `patches/two_level_fp4_state_patches.py`: bind after model creation, install DeOsc, save/restore state around standard Primus checkpoint calls |
 | Native checkpoint harness | `core/fp4_checkpoint.py`: real Megatron `torch_dist` model/optimizer tensors plus rank-local RNG and strict FP4 sidecars |
 
@@ -54,8 +54,10 @@ outer amax reductions while preserving strict/deferred finite-input checks.
 The native TE route rejects this option rather than ignoring its scale policy.
 
 Full and optimizer-sharded DeOsc use the same fixed-one QDQ. Sharded execution
-still performs collective nonfinite rejection and exchanges complete boundary
-tiles, including when a rank owns no elements. The recipe and checkpoint
+still performs collective nonfinite rejection, including when a rank owns no
+elements. The default `weight_deosc_shard_boundary_mode: zero_fill` treats remote
+weights in crossing tiles as zero; explicit `exact` exchanges boundary weights.
+The recipe and checkpoint
 fingerprints distinguish `none` from `tensor`, so their states cannot be
 silently interchanged. For fresh paired experiments, the same seed, rank and
 module name retain the same SR/RHT stream keys and reservation order across
@@ -131,7 +133,9 @@ exact continuation and the absence of host SR arrays. Device execution and
 end-to-end training qualification remain separate gates; a hardware test is
 included in `test_fp4_gpu_rng.py` and skips without an allocated GPU.
 
-DeOsc uses the same BF16 pre-rounding and whole-bank forward grid as the GEMM.
+DeOsc uses the same BF16 pre-rounding and whole-bank outer scale as the GEMM.
+With zero-filled shard boundaries its inner grid may differ on crossing tiles;
+explicit `exact` also reconstructs the whole-bank forward inner grid.
 It defaults to Primus's BF16 snapshot/subtraction policy, FP32 distance sums,
 epsilon `1e-12`, and FP32 master snap. `weight_deosc_accumulator_dtype: bf16`
 selects BF16 distance sums and defaults epsilon to `1e-30`, matching
@@ -171,9 +175,10 @@ checkpoint identity still includes that choice and rejects implementation
 switches on resume. Older checkpoints without the new quantizer identity also
 fail strict continuation; no implicit migration is performed.
 Replicated DeOsc schema v2 records a complete window-presence manifest, so a
-missing active window is rejected instead of silently reseeded. Sharded schema
-v3 additionally pins process-group membership and each logical parameter's flat
-partitions. Restore requires the same topology and partition layout; elastic
+missing active window is rejected instead of silently reseeded. Sharded exact
+schema v3 additionally pins process-group membership and each logical parameter's
+flat partitions; zero-fill schema v4 also pins its approximation policy.
+Restore requires the same topology, boundary policy and partition layout; elastic
 resharding is not implemented. Missing precision/epsilon identity fields and
 the prior v1 schema are rejected explicitly.
 
@@ -215,10 +220,18 @@ prefix; the private SR/RHT stream retains it unchanged.
 
 Each update reduces BF16-rounded master maxima across the optimizer's actual DP
 group, preserving one outer scalar for the complete `[E,N,K]` expert bank.
-Only tile-row stripes crossed by partition boundaries are exchanged. Locally
-complete interiors use the existing quantizer directly; crossing stripes are
-reconstructed exactly, including non-aligned dimensions and expert boundaries.
-There is no full-parameter master all-gather or boundary zero-fill approximation.
+The default `weight_deosc_shard_boundary_mode: zero_fill` uses the same boundary
+approximation as MXFP4: build the logical local slab with unavailable weight
+elements set to zero, quantize it, and retain only owned elements. No boundary
+weight buffer or weight SUM collective is needed. This can change inner scales
+and snap decisions for tiles that cross a shard boundary; complete local tiles
+retain the same grid. A tiny MAX reduction for outer amax/nonfinite rejection
+and the existing active/window consistency checks remain. This is not a claim
+of zero communication or exact equivalence to full-weight QDQ.
+
+Explicit `weight_deosc_shard_boundary_mode: exact` retains the previous
+tile-row-stripe SUM reconstruction, including non-aligned dimensions and
+expert boundaries. Neither mode all-gathers a full master parameter.
 After snapping, all ranks recompute the scales from the updated masters.
 
 Persistent `prev`, `prev_q`, `dist_w` and `dist_q` contain only locally owned
@@ -236,10 +249,41 @@ formats, 1-D/2-D weight blocks, BF16/FP32 distances, crossed blocks/experts,
 non-aligned shapes and empty owners. These tests do not qualify GPU performance,
 the full model, data-loader continuation or convergence.
 
-The existing MXFP4 DeOsc implementation uses FP32 distances but approximates
-cross-shard boundary blocks with zero-fill. Its boundary policy differs from
-this exact two-level path. A first comparison with that baseline is a comparison
-of deployable recipes; its outcome cannot be attributed solely to FP4 format.
+The default now matches MXFP4's zero-fill boundary rule, while keeping the
+two-level format's block16/16x16 geometry and global outer scalar. The exact
+mode retains schema v3 for existing checkpoint replay; zero-fill uses schema
+v4 and records the mode. Cross-mode restore is rejected before state mutation.
+The historical FP32-Adam recipe generator explicitly pins `exact` so it still
+describes the old controls; existing frozen runs and their manifests are unchanged.
+
+## Shared gradient stochastic rounding
+
+`fp4_gradient_rounding_policy: recipe` preserves existing format-specific
+implementations. Opt-in `shared_philox` selects Philox4x32-10, high-24-bit
+uniforms and adjacent-E2M1 probability rounding: for a magnitude between `lo`
+and `hi`, round up with probability `(x - lo) / (hi - lo)`, with saturation at
+6. Inner-scale rounding and UOS selection remain separate from value SR.
+
+NVFP4/AMDFP4 must also set `fp4_quantizer: triton`,
+`fp4_sr_rng: triton_philox` and `fp4_gradient_sr: true`. This selects their
+existing numerical/RNG implementation without changing its private streams,
+checkpoint fingerprints or H32 RHT. H16 remains an explicit independent option.
+MXFP4 enables `mxfp4_gradient_stochastic_rounding: true` and uses a Primus
+adapter for gradient packed-value production; its native E8M0 scale/UOS,
+layout metadata and GEMM remain in use. The adapter first requests the native
+RNE producer, then overwrites gradient packed values using the shared SR law.
+It intentionally adds quantization work for comparison; it is not a throughput
+optimization. Bypassing fused backward producers are rejected explicitly.
+
+This aligns the RNG algorithm and rounding law, not every random sample across
+formats. Block sizes, padding, H16 versus H32, call graphs and stream identities
+still differ. The old MX implementation's Wang-hash launch counter is not
+bitwise equivalent. Shared MX counter state must be saved/restored with its
+versioned rank-local checkpoint sidecar and restored after synthetic warmup.
+No training queue is resumed by selecting or testing these options.
+The mergeable `examples/megatron/low_precision/two_level_fp4/recipe_alignment.yaml`
+fragment lists the common settings. Native MX consumers still require their
+Turbo GEMM route flags; the two-level reference consumers keep their own routes.
 
 ## Validation and reproduction
 
