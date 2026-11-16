@@ -142,6 +142,10 @@ weight_deosc_epsilon: null
 # outside the local shard as zero. Exact exchanges boundary weights instead.
 # Tensor outer scale still uses a small global MAX in both modes.
 weight_deosc_shard_boundary_mode: zero_fill # zero_fill or exact
+# NVFP4/AMDFP4 reference DeOsc history placement. CPU keeps detector arithmetic
+# on the parameter device and moves only history between updates; recipe and
+# checkpoint numerical identity are unchanged. MXFP4 requires device.
+weight_deosc_state_residency: device # device or cpu
 # log a summary every N periods (0 disables logging)
 weight_deosc_log_freq: 0
 # use Primus-Turbo fused distance-update and period-closure kernels

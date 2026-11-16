@@ -73,6 +73,22 @@ def gradient_rounding_policy(config, fallback=None):
     return policy
 
 
+def deosc_state_residency(config, fallback=None):
+    """History placement is operational metadata, not a quantization recipe field."""
+    residency = option(config, "weight_deosc_state_residency", "device", fallback)
+    if residency not in ("device", "cpu"):
+        raise ValueError("weight_deosc_state_residency must be device or cpu")
+    if residency == "cpu":
+        recipe = _name(option(config, "fp4_recipe", fallback=fallback))
+        if not option(config, "fp4", None, fallback) or recipe not in ("nvfp4", "amdfp4"):
+            raise ValueError("weight_deosc_state_residency=cpu requires enabled NVFP4/AMDFP4")
+        if not _boolean(option(config, "weight_deosc", False, fallback), "weight_deosc"):
+            raise ValueError("weight_deosc_state_residency=cpu requires weight_deosc=true")
+        if option(config, "fp4_backend", "auto", fallback) != "reference":
+            raise ValueError("weight_deosc_state_residency=cpu requires fp4_backend=reference")
+    return residency
+
+
 def build_two_level_config(config, fallback=None):
     fields = {
         "block_size": ("fp4_block_size", 16),
@@ -131,6 +147,7 @@ class FP4ExecutionPlan:
 def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
     if module_kind not in ("dense", "grouped"):
         raise ValueError(f"Unknown FP4 module kind: {module_kind}")
+    deosc_state_residency(config, fallback)
     recipe = build_two_level_config(config, fallback)
     backend = option(config, "fp4_backend", "auto", fallback)
     turbo = _boolean(option(config, "enable_primus_turbo", False, fallback), "enable_primus_turbo")
@@ -243,6 +260,7 @@ def resolve_fp4_plan(config, module_kind="dense", fallback=None, environ=None):
 
 def validate_fp4_options(args, environ=None, require_runtime=True):
     """Called by argument validation and by the CPU preflight tool."""
+    deosc_state_residency(args)
     comparison_rmsnorm_backend(args, environ=environ)
     if not option(args, "fp4"):
         if option(args, "fp4_backend", "auto") != "auto":

@@ -179,6 +179,7 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
         accumulator_dtype="fp32",
         epsilon=None,
         boundary_mode="zero_fill",
+        state_residency="device",
     ):
         initialized = dist.is_available() and dist.is_initialized()
         if process_group is not None and not initialized:
@@ -209,10 +210,12 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
                 active_modules=active_modules,
                 accumulator_dtype=accumulator_dtype,
                 epsilon=epsilon,
+                state_residency=state_residency,
             )
             metadata = {
                 "settings": super()._identity()["settings"],
                 "boundary_mode": self.boundary_mode,
+                "state_residency": self.state_residency,
                 "bindings": {
                     key: {
                         "shape": list(item.model.shape),
@@ -268,6 +271,7 @@ class ShardedTwoLevelDeOsc(TwoLevelDeOsc):
             if (
                 metadata["settings"] != reference["settings"]
                 or metadata["boundary_mode"] != reference["boundary_mode"]
+                or metadata["state_residency"] != reference["state_residency"]
                 or metadata["bindings"].keys() != reference["bindings"].keys()
             ):
                 raise ValueError("Sharded DeOsc ranks disagree on settings or logical parameter keys")

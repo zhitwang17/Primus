@@ -49,6 +49,10 @@ class TwoLevelDeOsc:
     reset that parameter's partial window, and recipe changes fail explicitly.
     ``period`` counts deltas after the first seeding observation; ``start_step``
     is a successful optimizer-update index (0 begins on the first update).
+    ``state_residency='cpu'`` retains only history tensors on the host between
+    updates; every QDQ, delta, accumulation and snap still runs on the master's
+    device with unchanged dtypes. Residency is operational, so checkpoint
+    numerical identity remains compatible across device/CPU storage modes.
     """
 
     def __init__(
@@ -61,6 +65,7 @@ class TwoLevelDeOsc:
         active_modules=None,
         accumulator_dtype="fp32",
         epsilon=None,
+        state_residency="device",
     ):
         if type(period) is not int or period <= 0:
             raise ValueError("weight_deosc_period must be a positive integer")
@@ -68,6 +73,10 @@ class TwoLevelDeOsc:
             raise ValueError("weight_deosc_ratio must be finite and positive")
         if type(start_step) is not int or start_step < 0:
             raise ValueError("weight_deosc_start_step must be a nonnegative integer")
+        if state_residency not in ("device", "cpu"):
+            raise ValueError("weight_deosc_state_residency must be device or cpu")
+        self.state_residency = state_residency
+        self._step_error = None
         if not bindings or any(not isinstance(key, str) or not key for key in bindings):
             raise ValueError("DeOsc requires nonempty stable parameter keys")
         self.bindings = dict(bindings)
@@ -179,27 +188,60 @@ class TwoLevelDeOsc:
     @torch.no_grad()
     def step(self):
         """Observe one successful master update; never perform the model copy."""
-        active = self._active_bindings()
-        self.step_count += 1
-        if self.step_count < max(1, self.start_step):
-            return self.stats
-        for key, (model, master, config) in self.bindings.items():
-            if not active[key]:
-                self._states.pop(key, None)
-                continue
-            current = self._master_view(model, master).to(torch.bfloat16)
-            quantized = self._weight_qdq(master, model, config)
-            self._stats["observations"] += 1
-            state = self._states.get(key)
-            if state is None:
-                self._states[key] = {
-                    "prev": current.clone(),
-                    "prev_q": quantized.clone(),
-                    "dist_w": torch.zeros_like(current, dtype=self.accumulator_dtype),
-                    "dist_q": torch.zeros_like(current, dtype=self.accumulator_dtype),
-                    "window_steps": 0,
-                }
-                continue
+        if self._step_error is not None:
+            raise RuntimeError(
+                "DeOsc failed during an earlier update; restore a valid checkpoint before continuing"
+            )
+        try:
+            active = self._active_bindings()
+            self.step_count += 1
+            if self.step_count < max(1, self.start_step):
+                return self.stats
+            for key, (model, master, config) in self.bindings.items():
+                if not active[key]:
+                    self._states.pop(key, None)
+                    continue
+                # Each call releases its temporary device history before the next
+                # parameter. CPU residency never stages every parameter at once.
+                self._observe_binding(key, model, master, config)
+        except Exception as error:
+            if self.state_residency == "cpu":
+                # Some earlier parameters or masters may already have changed.
+                # Never publish a mixed observation window as a usable sidecar.
+                # Store only text, not a traceback retaining temporary GPU tensors.
+                self._step_error = type(error).__name__
+            raise
+        return self.stats
+
+    @staticmethod
+    def _copy_history(state, device):
+        # Blocking, dtype-preserving copies make completion/lifetime explicit.
+        # copy=True also prevents aliasing when tests or checkpoints use CPU masters.
+        return {
+            name: (
+                value.detach().to(device=device, copy=True, non_blocking=False)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for name, value in state.items()
+        }
+
+    def _observe_binding(self, key, model, master, config):
+        current = self._master_view(model, master).to(torch.bfloat16)
+        quantized = self._weight_qdq(master, model, config)
+        self._stats["observations"] += 1
+        state = self._states.get(key)
+        if state is None:
+            state = {
+                "prev": current.clone(),
+                "prev_q": quantized.clone(),
+                "dist_w": torch.zeros_like(current, dtype=self.accumulator_dtype),
+                "dist_q": torch.zeros_like(current, dtype=self.accumulator_dtype),
+                "window_steps": 0,
+            }
+        else:
+            if self.state_residency == "cpu":
+                state = self._copy_history(state, master.device)
             # Deliberately retain the existing BF16 subtract/abs rounding.
             state["dist_w"].add_((current - state["prev"]).abs())
             state["dist_q"].add_((quantized - state["prev_q"]).abs())
@@ -221,9 +263,11 @@ class TwoLevelDeOsc:
                 state["window_steps"] = 0
             state["prev"] = current.clone()
             state["prev_q"] = quantized.clone()
-        return self.stats
+        self._states[key] = self._copy_history(state, "cpu") if self.state_residency == "cpu" else state
 
     def state_dict(self):
+        if self._step_error is not None:
+            raise RuntimeError("Cannot checkpoint DeOsc after a failed update; restore a valid checkpoint")
         return {
             **self._identity(),
             "step_count": self.step_count,
@@ -306,7 +350,10 @@ class TwoLevelDeOsc:
         restored = {
             key: {
                 name: (
-                    value.to(self.bindings[key][1].device).clone()
+                    value.to(
+                        "cpu" if self.state_residency == "cpu" else self.bindings[key][1].device,
+                        copy=True,
+                    )
                     if isinstance(value, torch.Tensor)
                     else value
                 )
@@ -317,6 +364,7 @@ class TwoLevelDeOsc:
         self._states = restored
         self.step_count = saved["step_count"]
         self._stats = dict(saved["stats"])
+        self._step_error = None
 
 
 def _leaf_optimizers(optimizer):
@@ -584,6 +632,7 @@ def install_megatron_deosc(optimizer, models, args):
             start_step=_get(args, "weight_deosc_start_step", 0),
             accumulator_dtype=_get(args, "weight_deosc_accumulator_dtype", "fp32"),
             epsilon=_get(args, "weight_deosc_epsilon", None),
+            state_residency=_get(args, "weight_deosc_state_residency", "device"),
         )
         is_distributed = hasattr(opt, "model_float16_groups")
         if _get(args, "use_distributed_optimizer", False) and not is_distributed:
