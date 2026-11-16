@@ -180,7 +180,12 @@ def _is_mxfp4_quantized_weight_buffer(buf) -> bool:
         return False
     if _float4_e2m1fn_x2 is None:
         return True
-    dtype = getattr(buf, "dtype", None)
+    # GAS > 1 caches a Turbo QuantizedTensor whose public dtype describes
+    # the original BF16 tensor. Its actual packed format is real_dtype.
+    # GAS == 1 uses an ordinary empty FP4 marker, which only exposes dtype.
+    # Prefer an explicitly reported real_dtype even when it is not FP4: a
+    # logical dtype must never turn an FP8 cache into an eligible FP4 weight.
+    dtype = getattr(buf, "real_dtype", getattr(buf, "dtype", None))
     if dtype is None:
         return False
     return dtype == _float4_e2m1fn_x2

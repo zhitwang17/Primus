@@ -539,6 +539,150 @@ def test_synthetic_warmup_rewinds_real_private_reservations_even_on_exception(sh
     assert h.runtime._reserve(29) == expected
 
 
+def _native_warmup_optimizer(monkeypatch):
+    class Runner:
+        def __init__(self, config):
+            self.config = config
+            self._global_step = self._period_index = 0
+            self._eligible_ids = None
+            self._state, self._loaded_params, self._state_slabs = {}, {}, {}
+            self._direct_states_ready = False
+            self.master = torch.tensor([0.75390625])
+            self.load_calls = 0
+
+        def run(self):
+            if self.config.enable:
+                self._global_step += 1
+                self.master.fill_(1)  # A snap must never run during synthetic warmup.
+
+        def state_dict(self):
+            return {
+                "global_step": self._global_step,
+                "period_index": self._period_index,
+                "params": copy.deepcopy(self._state),
+            }
+
+        def load_state_dict(self, saved):
+            self.load_calls += 1
+            self._global_step, self._period_index = saved["global_step"], saved["period_index"]
+            self._state.clear()
+            self._state_slabs.clear()
+            self._direct_states_ready = False
+            self._loaded_params = copy.deepcopy(saved["params"])
+
+    # The real installer shares one config across its optimizer runners.
+    config = SimpleNamespace(enable=True)
+    runners = [Runner(config), Runner(config)]
+    optimizer = SimpleNamespace(
+        chained_optimizers=[SimpleNamespace(_primus_weight_deosc_runner=runner) for runner in runners]
+    )
+    module = ModuleType("primus.backends.megatron.core.optimizer.weight_deosc")
+    module.iter_deosc_runners = lambda opt: [
+        child._primus_weight_deosc_runner for child in opt.chained_optimizers
+    ]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return optimizer, runners
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("eligible", [None, {123}])
+def test_native_deosc_is_disabled_and_restored_during_warmup(shared_hooks, monkeypatch, failure, eligible):
+    h = shared_hooks
+    h.install()
+    h.training.get_model()
+    optimizer, runners = _native_warmup_optimizer(monkeypatch)
+    for runner in runners:
+        runner._eligible_ids = copy.deepcopy(eligible)
+    private = h.runtime.state_dict()
+    masters = [runner.master.clone() for runner in runners]
+
+    def original(*args):
+        h.runtime._reserve(123)
+        for runner in runners:
+            assert runner.config.enable is False
+            runner.run()
+            assert runner._global_step == 0
+            # Also prove defensive restoration if another warmup hook writes
+            # state despite the native run() enable guard.
+            runner._global_step = runner._period_index = 7
+            runner._eligible_ids = {456}
+            runner._state = {"unexpected": torch.ones(1)}
+            runner._state_slabs = {"cuda": torch.ones(1)}
+            runner._direct_states_ready = True
+        if failure:
+            raise RuntimeError("injected warmup failure")
+        return "done"
+
+    wrapped = h.patch.wrap_shared_sr_warmup(original)
+    call = (None, None, h.model, optimizer, None, None, h.args)
+    if failure:
+        with pytest.raises(RuntimeError, match="injected warmup failure"):
+            wrapped(*call)
+    else:
+        assert wrapped(*call) == "done"
+    assert h.runtime.state_dict() == private
+    for runner, master in zip(runners, masters):
+        assert runner.config.enable is True
+        assert runner._global_step == runner._period_index == 0
+        assert runner._eligible_ids == eligible
+        assert not runner._state and not runner._state_slabs and not runner._loaded_params
+        assert runner._direct_states_ready is False
+        assert torch.equal(runner.master, master)
+
+
+@pytest.mark.parametrize("field", ["_global_step", "_state", "_loaded_params"])
+def test_native_deosc_continuation_skips_warmup(shared_hooks, monkeypatch, field):
+    h = shared_hooks
+    h.install()
+    h.training.get_model()
+    optimizer, runners = _native_warmup_optimizer(monkeypatch)
+    setattr(runners[0], field, 1 if field == "_global_step" else {"saved": torch.ones(1)})
+    calls = []
+    h.patch.wrap_shared_sr_warmup(lambda *args: calls.append(True))(
+        None, None, h.model, optimizer, None, None, h.args
+    )
+    assert not calls and all(runner.load_calls == 0 for runner in runners)
+    assert all(runner.config.enable for runner in runners)
+
+
+def test_native_deosc_identity_change_fails_after_restoring_flags_and_rng(shared_hooks, monkeypatch):
+    h = shared_hooks
+    h.install()
+    h.training.get_model()
+    optimizer, runners = _native_warmup_optimizer(monkeypatch)
+    private = h.runtime.state_dict()
+
+    def replace_runner(*args):
+        h.runtime._reserve(123)
+        optimizer.chained_optimizers[0]._primus_weight_deosc_runner = copy.deepcopy(runners[0])
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        h.patch.wrap_shared_sr_warmup(replace_runner)(None, None, h.model, optimizer, None, None, h.args)
+    assert h.runtime.state_dict() == private
+    assert all(runner.config.enable for runner in runners)
+    assert all(runner.load_calls == 1 for runner in runners)
+
+
+def test_native_restore_error_does_not_leave_other_runners_disabled(shared_hooks, monkeypatch):
+    h = shared_hooks
+    h.install()
+    h.training.get_model()
+    optimizer, runners = _native_warmup_optimizer(monkeypatch)
+    private = h.runtime.state_dict()
+
+    def fail_restore(saved):
+        raise OSError("injected restore failure")
+
+    monkeypatch.setattr(runners[0], "load_state_dict", fail_restore)
+    with pytest.raises(RuntimeError, match="Failed to restore native"):
+        h.patch.wrap_shared_sr_warmup(lambda *args: h.runtime._reserve(123))(
+            None, None, h.model, optimizer, None, None, h.args
+        )
+    assert h.runtime.state_dict() == private
+    assert all(runner.config.enable for runner in runners)
+    assert runners[1].load_calls == 1
+
+
 @pytest.mark.parametrize("continuation", ["iteration", "consumed", "scheduler", "adam_moments"])
 def test_continuation_skips_destructive_warmup_and_preserves_adam(shared_hooks, continuation):
     h = shared_hooks

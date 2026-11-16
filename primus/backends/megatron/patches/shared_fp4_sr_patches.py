@@ -380,6 +380,41 @@ def install_shared_mxfp4_training_state(args):
     return True
 
 
+def _native_deosc_runners(optimizer):
+    # Avoid importing the optional native GPU stack for optimizers with no
+    # native DeOsc runner (including CPU-only checkpoint-hook tests).
+    leaves = getattr(optimizer, "chained_optimizers", None) or [optimizer]
+    if not any(getattr(leaf, "_primus_weight_deosc_runner", None) is not None for leaf in leaves):
+        return []
+    from primus.backends.megatron.core.optimizer.weight_deosc import iter_deosc_runners
+
+    return iter_deosc_runners(optimizer)
+
+
+def _restore_native_deosc_warmup(optimizer, snapshots):
+    errors = []
+    try:
+        runners = _native_deosc_runners(optimizer)
+        same = len(runners) == len(snapshots) and all(
+            current is saved[0] and current.config is saved[3] for current, saved in zip(runners, snapshots)
+        )
+    except Exception as error:
+        errors.append(error)
+        same = False
+    for runner, state, eligible, config, enabled in snapshots:
+        try:
+            runner.load_state_dict(state)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            runner._eligible_ids = eligible
+            config.enable = enabled
+    if not same:
+        raise RuntimeError("Native MXFP4 DeOsc runner/config identity changed during synthetic warmup")
+    if errors:
+        raise RuntimeError("Failed to restore native MXFP4 DeOsc after synthetic warmup") from errors[0]
+
+
 def wrap_shared_sr_warmup(original):
     if getattr(original, _MARKER, False):
         return original
@@ -409,18 +444,42 @@ def wrap_shared_sr_warmup(original):
 
         # The upstream warmup clears floating optimizer state. A resumed Adam
         # trajectory must skip it, including ranks that locally own no moments.
-        reason = _collective_resume_reason(_resume_reason(megatron_args, optimizer, opt_param_scheduler))
+        native_runners = _native_deosc_runners(optimizer)
+        reason = _resume_reason(megatron_args, optimizer, opt_param_scheduler)
+        if not reason and any(
+            runner._global_step or runner._state or runner._loaded_params for runner in native_runners
+        ):
+            reason = "native MXFP4 DeOsc continuation state"
+        reason = _collective_resume_reason(reason)
         if reason:
             log_rank_0(f"[SharedFP4SR] Synthetic warmup skipped: {reason}; continuation state retained")
             return None
         runtime = _ensure_runtime(megatron_args)
         saved = copy.deepcopy(runtime.state_dict())
         global_rng = _capture_rng()
+        # Capture every original flag before disabling any runner: multiple
+        # optimizers can share one WeightDeOscConfig instance. Warmup must not
+        # snap real masters or allocate/advance DeOsc history, even temporarily.
+        native_snapshots = [
+            (
+                runner,
+                copy.deepcopy(runner.state_dict()),
+                None if runner._eligible_ids is None else set(runner._eligible_ids),
+                runner.config,
+                runner.config.enable,
+            )
+            for runner in native_runners
+        ]
+        for runner in native_runners:
+            runner.config.enable = False
         try:
             return original(*call)
         finally:
             try:
-                runtime.load_state_dict(saved)
+                try:
+                    _restore_native_deosc_warmup(optimizer, native_snapshots)
+                finally:
+                    runtime.load_state_dict(saved)
             finally:
                 _restore_rng(global_rng)
 

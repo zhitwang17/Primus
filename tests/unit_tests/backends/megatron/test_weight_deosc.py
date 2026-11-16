@@ -13,6 +13,9 @@ get wrong: DistRatio snap masking, write-back into the local fp32 shard, period
 reset, and checkpoint state round-trip.
 """
 
+import ast
+import importlib.util
+from pathlib import Path
 import sys
 import types
 
@@ -46,6 +49,100 @@ def _fp4_buffer():
 
 def _fp8_buffer():
     return types.SimpleNamespace(dtype=_FP8_DTYPE)
+
+
+def _real_cached_buffer(dtype):
+    """Use the installed Turbo constructor/properties without importing GPU backends.
+
+    Turbo's package import probes GPU architecture, even for CPU metadata.
+    Execute the real wrapper constructor and dtype properties from its source;
+    tensor dispatch is forbidden because no quantization is needed for this test.
+    """
+    spec = importlib.util.find_spec("primus_turbo")
+    if spec is None or not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("Installed Turbo source and Torch FP4 dtype required")
+    source = Path(spec.origin).parent / "pytorch/core/quantized_tensor.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QuantizedTensor"
+    )
+    cls.body = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in ("__new__", "dtype", "real_dtype")
+    ]
+    cls.body += ast.parse(
+        """@classmethod
+def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+    raise AssertionError("metadata-only cache test must not dispatch tensor operations")
+"""
+    ).body
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls],
+        type_ignores=[],
+    )
+    namespace = {"torch": torch, "_SUPPORTED_QUANTIZED_DTYPES": (dtype,)}
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    return namespace["QuantizedTensor"](
+        torch.empty((16, 8), dtype=dtype),
+        torch.empty((16, 1), dtype=torch.uint8),
+        shape=torch.Size((16, 16)),
+        orig_dtype=torch.bfloat16,
+        dest_dtype=dtype,
+        granularity=None,
+    )
+
+
+@pytest.mark.parametrize("fp4", [True, False])
+def test_real_cached_quantized_tensor_uses_physical_dtype(fp4, monkeypatch):
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("Torch FP4 dtype required")
+    actual = torch.float4_e2m1fn_x2 if fp4 else torch.float8_e4m3fn
+    buffer = _real_cached_buffer(actual)
+    monkeypatch.setattr(weight_deosc, "_float4_e2m1fn_x2", torch.float4_e2m1fn_x2)
+    assert buffer.dtype == torch.bfloat16 and buffer.real_dtype == actual
+    assert weight_deosc._is_mxfp4_quantized_weight_buffer(buffer) is fp4
+    assert weight_deosc._is_mxfp4_quantized_weight_buffer(torch.empty(0, dtype=torch.float4_e2m1fn_x2))
+
+
+def test_physical_dtype_takes_precedence_over_logical_fp4_marker():
+    for actual in (_FP8_DTYPE, None):
+        assert not weight_deosc._is_mxfp4_quantized_weight_buffer(
+            types.SimpleNamespace(dtype=_FP4_DTYPE, real_dtype=actual)
+        )
+
+
+def test_real_cached_buffers_cover_dense_and_grouped_but_not_fp8(monkeypatch):
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("Torch FP4 dtype required")
+    monkeypatch.setattr(weight_deosc, "_float4_e2m1fn_x2", torch.float4_e2m1fn_x2)
+    dense, grouped, fp8 = (torch.zeros(16, 16), torch.zeros(2, 16, 16), torch.zeros(16, 16))
+    chunk = _FakeMultiChunk(
+        _FakeModule(dense, _real_cached_buffer(torch.float4_e2m1fn_x2)),
+        types.SimpleNamespace(
+            _parameters={},
+            weights=grouped,
+            quantized_weight_buffer=_real_cached_buffer(torch.float4_e2m1fn_x2),
+        ),
+        _FakeModule(fp8, _real_cached_buffer(torch.float8_e4m3fn)),
+        types.SimpleNamespace(_parameters={"weight": torch.zeros(16, 16)}, quantized_weight_buffer=None),
+    )
+    runner = WeightDeOscRunner(WeightDeOscConfig(enable=True))
+    assert runner._build_eligible_ids(types.SimpleNamespace(model_chunks=[chunk])) == {id(dense), id(grouped)}
+    # Exercise the real runner's discovery/seed path too: eligible cached
+    # weights must produce history, not merely pass a standalone predicate.
+    monkeypatch.setattr(weight_deosc, "qdq_mxfp4", _fake_qdq_round)
+    opt = types.SimpleNamespace(
+        model_chunks=[chunk],
+        model_float16_groups=[[dense, grouped, fp8]],
+        shard_fp32_from_float16_groups=[[value.float().flatten().clone() for value in (dense, grouped, fp8)]],
+        _get_model_param_range_map=lambda model: {"param": types.SimpleNamespace(start=0, end=model.numel())},
+        _param_name=lambda model: "dense" if model is dense else "grouped" if model is grouped else "fp8",
+    )
+    runner.run(opt)
+    assert runner._global_step == 1
+    assert len(runner._state) == 2
+    assert sum(state.prev.numel() for state in runner._state.values()) == dense.numel() + grouped.numel()
 
 
 # ---------------------------------------------------------------------------

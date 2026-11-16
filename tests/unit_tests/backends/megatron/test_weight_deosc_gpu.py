@@ -28,6 +28,77 @@ pytestmark = [
 BLOCK = weight_deosc.MXFP4_SCALING_BLOCK_SIZE
 
 
+def test_real_cached_weights_seed_native_deosc_and_close_window(monkeypatch):
+    """GAS2-style real caches must activate dense/MoE DeOsc, while FP8 stays excluded."""
+    from types import SimpleNamespace
+
+    from primus_turbo.pytorch.core.low_precision import float8_e4m3
+
+    monkeypatch.setattr(weight_deosc, "_forward_scale_rounding_mode", lambda: 2)
+    quantized = weight_deosc._PrimusTurboQuantizedTensor
+    granularity = weight_deosc._ScalingGranularity
+    physical_fp4 = weight_deosc._float4_e2m1fn_x2
+    dense = torch.full((64, 64), 6.0, device="cuda", dtype=torch.bfloat16)
+    grouped = torch.full((2, 64, 64), 6.0, device="cuda", dtype=torch.bfloat16)
+    fp8 = torch.full((64, 64), 6.0, device="cuda", dtype=torch.bfloat16)
+
+    def cache(value):
+        return quantized.quantize(
+            value,
+            physical_fp4,
+            granularity.MX_BLOCKWISE,
+            block_size=BLOCK,
+            scaling_recipe=weight_deosc._ScalingRecipe(use_2d_block=True),
+            axis=-1,
+            scale_rounding_mode=2,
+        )
+
+    dense_cache, grouped_cache = cache(dense), cache(grouped)
+    fp8_cache = quantized.quantize(fp8, float8_e4m3, granularity.TENSORWISE)
+    assert dense_cache.dtype == grouped_cache.dtype == fp8_cache.dtype == torch.bfloat16
+    assert dense_cache.real_dtype == grouped_cache.real_dtype == physical_fp4
+    assert not weight_deosc._is_mxfp4_quantized_weight_buffer(fp8_cache)
+    modules = [
+        SimpleNamespace(_parameters={"weight": dense}, quantized_weight_buffer=dense_cache),
+        SimpleNamespace(_parameters={}, weights=grouped, quantized_weight_buffer=grouped_cache),
+        SimpleNamespace(_parameters={"weight": fp8}, quantized_weight_buffer=fp8_cache),
+    ]
+    masters = [value.float().flatten().clone() for value in (dense, grouped, fp8)]
+    optimizer = SimpleNamespace(
+        model_chunks=[SimpleNamespace(modules=lambda: modules)],
+        model_float16_groups=[[dense, grouped, fp8]],
+        shard_fp32_from_float16_groups=[masters],
+        _get_model_param_range_map=lambda model: {"param": SimpleNamespace(start=0, end=model.numel())},
+        _param_name=lambda model: "dense" if model is dense else "grouped" if model is grouped else "fp8",
+    )
+    runner = weight_deosc.WeightDeOscRunner(
+        weight_deosc.WeightDeOscConfig(enable=True, period=2, fusion=True, direct_qdq=True)
+    )
+    calls = []
+    native_qdq = weight_deosc._weight_deosc_qdq
+
+    def record(*args, **kwargs):
+        calls.append((kwargs["seed"], kwargs["close"]))
+        return native_qdq(*args, **kwargs)
+
+    monkeypatch.setattr(weight_deosc, "_weight_deosc_qdq", record)
+    for index in range(3):
+        for master in masters[:2]:
+            master[0] = 0.75390625 if index % 2 else 0.74609375
+        runner.run(optimizer)
+    torch.cuda.synchronize()
+    assert runner._global_step == 3 and runner._period_index == 1
+    assert runner._eligible_ids == {id(dense), id(grouped)}
+    assert len(runner._state) == 2
+    assert sum(state.prev.numel() for state in runner._state.values()) == 3 * 64 * 64
+    assert calls == [(True, False)] * 2 + [(False, False)] * 2 + [(False, True)] * 2
+    for state in runner._state.values():
+        assert state.step == 0
+        assert state.prev.dtype == state.prev_q.dtype == torch.bfloat16
+        assert state.dist_w.dtype == state.dist_w_qdq.dtype == torch.float32
+        assert state.dist_w.count_nonzero() == state.dist_w_qdq.count_nonzero() == 0
+
+
 @pytest.fixture(params=[0, 2], ids=["round0", "round2"])
 def scale_rounding_mode(request, monkeypatch):
     monkeypatch.setattr(weight_deosc, "_forward_scale_rounding_mode", lambda: request.param)
