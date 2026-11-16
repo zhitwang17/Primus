@@ -57,6 +57,7 @@ class TwoLevelFP4Config:
     version: int = 1
     sr_rng: str = "torch_cpu"
     value_checks: str = "strict"
+    rht_mode: str = "legacy"
 
     def __post_init__(self):
         object.__setattr__(self, "recipe", _name(self.recipe))
@@ -77,9 +78,15 @@ class TwoLevelFP4Config:
         if self.block_size != 16 or isinstance(self.block_size, bool):
             raise ValueError("NVFP4/AMDFP4 inner block_size must be 16")
         if self.outer_scope not in ("tensor", "none") or self.inner_storage != "float32_grid":
-            raise ValueError("Reference contract supports tensor/none outer scope and float32_grid inner storage")
+            raise ValueError(
+                "Reference contract supports tensor/none outer scope and float32_grid inner storage"
+            )
         if type(self.rht_size) is not int or self.rht_size not in (0, 16, 32):
             raise ValueError("rht_size must be 0 (disabled), 16, or 32")
+        if self.rht_mode not in ("legacy", "mxfp4"):
+            raise ValueError("rht_mode must be legacy or mxfp4")
+        if self.rht_mode == "mxfp4" and (self.rht_size != 16 or self.rht_randomized):
+            raise ValueError("rht_mode=mxfp4 requires rht_size=16 and rht_randomized=false")
         if type(self.rng_seed) is not int or not 0 <= self.rng_seed < 2**63:
             raise ValueError("rng_seed must be an integer in [0, 2**63)")
         if type(self.version) is not int or self.version != 1:
@@ -106,6 +113,8 @@ class TwoLevelFP4Config:
             values.pop("sr_rng")
         if self.value_checks == "strict":
             values.pop("value_checks")
+        if self.rht_mode == "legacy":
+            values.pop("rht_mode")
         return values
 
     @property
@@ -114,11 +123,15 @@ class TwoLevelFP4Config:
 
     @property
     def rng_fingerprint(self):
-        """Kernel/SR/outer-scale selection must not perturb the random streams."""
+        """Kernel/SR/outer-scale/RHT arithmetic choices preserve random streams."""
         numerical = self.to_dict()
         numerical.pop("quantizer")
         numerical.pop("sr_rng", None)
         numerical.pop("value_checks", None)
+        # Changing the deterministic H16 arithmetic/precision must not also
+        # change the sampled SR uniforms. Full checkpoint identity still
+        # includes rht_mode through fingerprint, so continuation cannot mix it.
+        numerical.pop("rht_mode", None)
         # Preserve existing tensor-mode stream IDs, while keeping an outer-off
         # comparison on the same SR/RHT samples. Full recipe/checkpoint identity
         # still includes the actual outer_scope via fingerprint.

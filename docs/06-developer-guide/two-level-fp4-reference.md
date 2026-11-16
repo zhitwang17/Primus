@@ -287,8 +287,8 @@ Turbo GEMM route flags; the two-level reference consumers keep their own routes.
 
 ### Deterministic H16x2 comparison preparation
 
-The updated alignment fragment explicitly sets `fp4_rht_size: 16` and
-`fp4_rht_randomized: false`. Two independent normalized H16 transforms within
+The updated alignment fragment explicitly sets `fp4_rht_size: 16`,
+`fp4_rht_randomized: false` and `fp4_rht_mode: mxfp4`. Two independent normalized H16 transforms within
 each 32-value interval are the H16x2 transform used by native MXFP4; this is not
 two successive H16 applications or an H32 transform. Reference grouped operands
 pad each expert independently. Both routes apply this paired transform along the
@@ -296,20 +296,49 @@ wgrad token-reduction axis. No random signs, permutation or RHT RNG consumption
 is involved. Existing defaults and frozen H32 experiment recipes remain intact;
 an old H32 checkpoint cannot be loaded as this new H16 recipe.
 
-This aligns the transform geometry, not every arithmetic boundary. Reference
-NVFP4/AMDFP4 compute the transform in FP32 and cast back to the BF16 operand dtype
-before FP4 QDQ; native MXFP4 quantizes the FP32 butterfly result directly. MX
-caches the transformed activation during forward, whereas the reference route
-transforms the paired activation and gradient during backward. Block/scale
-geometry, tensor outer scale and random-stream layout remain format-specific.
+The `mxfp4` mode follows Turbo's FP32 H4-local, XOR1 and XOR2 butterfly stages
+with the final 0.25 normalization. It avoids matrix multiplication, TF32 and
+autocast reduction of the RHT arithmetic. The resulting FP32 values feed outer
+and inner scale selection and FP4 quantization directly, with no preceding BF16
+rounding. The QDQ consumer explicitly dequantizes the result to the original
+BF16 operand dtype before the wgrad GEMM. Grouped outer scales still cover the
+entire transformed routed buffer, with independent padding for each expert.
+The active FlyDSL MX producer can fold the 0.25 normalization into its E8M0
+scale computation (`post_scale=False`, `exp_up=2`); the normalized H16 semantics
+are the same, although the multiplication is not in the same instruction location.
+
+Default `fp4_rht_mode: legacy` preserves the historical H32/randomized and H16
+reference behavior and checkpoint fingerprints. The new mode enters the full
+recipe/checkpoint identity, and cross-mode continuation is rejected. It is
+excluded from RNG seed derivation: switching an otherwise identical H16
+deterministic recipe does not also change its private SR samples. Native MX's
+explicit alignment policy is likewise recorded in the shared-SR sidecar without
+changing legacy sidecars. `tools/fp4_smoke.py --rht-mode mxfp4` selects the same
+H16/deterministic settings for a future bounded device qualification.
+
+MX still caches the transformed activation during forward, whereas the
+reference route transforms the paired activation and gradient during backward.
+Block/scale geometry, tensor outer scale, GEMM arithmetic, grouped padding and
+random-stream layout remain format-specific. Matching RHT operations does not
+claim full-format bitwise equality or a measured convergence improvement.
 
 CPU checks cover independent H16 butterflies, tails, orthogonal pair
 cancellation, expert isolation, deterministic/private RNG behavior, dense and
-grouped autograd, the BF16 intermediate and checkpoint identity. They do not
+grouped autograd, the FP32 quantizer/BF16 GEMM boundary and checkpoint identity. They do not
 qualify the new three-way full-model training configuration on a GPU. The
 knowledge-base `scripts/fp4_rht16x2_compare_20261116/` preparation tools produce
 separate DP8 admissions and 3K controls, retain BF16 Adam and the default full
 learning-rate horizon, and do not register or launch a training queue by default.
+
+Independent tests execute extracted FlyDSL stock H16 helpers and the shared-SR
+Triton H16 helper against an FP32 bit oracle. Triton CPU interpretation also
+matches packed FP4 values, inner/outer scales and FP32 QDQ bitwise. The pinned
+interpreter's implicit FP32-to-BF16 store truncates rather than applying Torch's
+nearest-even conversion; that known interpreter behavior is characterized
+separately and cannot qualify device BF16 rounding. Actual GPU admission and
+convergence remain pending. Mixed saved FP32/BF16 wgrad inputs use an explicit
+common promoted dtype; ordinary BF16 training remains BF16. This change does
+not extend the existing reference dgrad support to every mixed-autocast case.
 
 ### November 16 recipe-gap verification
 

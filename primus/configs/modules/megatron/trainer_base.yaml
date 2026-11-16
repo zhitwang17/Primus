@@ -73,6 +73,7 @@ fp4_outer_scope: tensor
 fp4_inner_storage: float32_grid
 fp4_rht_size: 32
 fp4_rht_randomized: true
+fp4_rht_mode: legacy # mxfp4: deterministic H16 FP32 butterfly through FP4 quantization
 fp4_gradient_sr: true
 fp4_rng_seed: null # defaults to training seed; private SR/RHT counter streams
 fp4_quantizer: torch # torch reference, or opt-in Triton two-level QDQ kernels

@@ -44,10 +44,16 @@ def _check_random(config, random):
         raise ValueError("FP4 RNG recipe does not match GEMM config")
 
 
-def _q(x, config, direction, role, random, outer=None, validation=None):
+def _q(x, config, direction, role, random, outer=None, validation=None, *, dtype=None):
     kwargs = {"validation": validation} if validation is not None else {}
     return qdq(
-        x, config, config.operand(direction, role), outer_scale=outer, random=random, dtype=x.dtype, **kwargs
+        x,
+        config,
+        config.operand(direction, role),
+        outer_scale=outer,
+        random=random,
+        dtype=x.dtype if dtype is None else dtype,
+        **kwargs,
     )
 
 
@@ -57,6 +63,16 @@ def _grouped_checks(x, config):
 
         return DeferredValueChecks(x.device)
     return nullcontext(None)
+
+
+def _wgrad_dtypes(x, dy, config):
+    if config.rht_mode == "mxfp4":
+        # Autocast can produce BF16 grad_output from FP32 saved activations.
+        # The explicit-autocast-off wgrad needs a common operand dtype; retain
+        # BF16 for ordinary BF16 training and promote mixed inputs explicitly.
+        dtype = torch.promote_types(x.dtype, dy.dtype)
+        return dtype, dtype
+    return x.dtype, dy.dtype
 
 
 class _Linear(torch.autograd.Function):
@@ -87,9 +103,18 @@ class _Linear(torch.autograd.Function):
             _record(config, "dense", "dgrad")
         if ctx.needs_input_grad[1]:
             xh, dyh = rht_pair(flat, dy, config, random=random)
-            xq = _q(xh, config, "wgrad", "input", random)
-            dyq = _q(dyh, config, "wgrad", "grad_output", random)
-            dw = dyq.t() @ xq
+            # MX-aligned RHT remains FP32 up to FP4 conversion. Dequantize
+            # into the original dtype (promoted only for mixed saved inputs)
+            # so BF16 training still uses BF16 GEMM.
+            x_dtype, dy_dtype = _wgrad_dtypes(flat, dy, config)
+            xq = _q(xh, config, "wgrad", "input", random, dtype=x_dtype)
+            dyq = _q(dyh, config, "wgrad", "grad_output", random, dtype=dy_dtype)
+            with (
+                torch.autocast(device_type=x.device.type, enabled=False)
+                if config.rht_mode == "mxfp4"
+                else nullcontext()
+            ):
+                dw = dyq.t() @ xq
             _record(config, "dense", "wgrad")
         return dx, dw, None, None
 
@@ -167,18 +192,28 @@ class _GroupedLinear(torch.autograd.Function):
                 ]
                 # wgrad's outer scope is the full transformed routed buffer. RHT is
                 # independently padded per expert and shared by both operands.
+                # MX-aligned mode supplies FP32 here; do not round to BF16 before
+                # collecting this whole-bank statistic or change to expert amax.
                 outer_x = compute_outer_scale(
                     torch.cat([a for a, _ in transformed]), config, validation=validation
                 )
                 outer_dy = compute_outer_scale(
                     torch.cat([b for _, b in transformed]), config, validation=validation
                 )
+                x_dtype, dy_dtype = _wgrad_dtypes(x, dy, config)
                 dw = torch.zeros_like(weights)
                 for i, ((a, b), n) in enumerate(zip(transformed, lengths)):
                     if n:
-                        aq = _q(a, config, "wgrad", "input", random, outer_x, validation)
-                        bq = _q(b, config, "wgrad", "grad_output", random, outer_dy, validation)
-                        dw[i] = bq.t() @ aq
+                        aq = _q(a, config, "wgrad", "input", random, outer_x, validation, dtype=x_dtype)
+                        bq = _q(
+                            b, config, "wgrad", "grad_output", random, outer_dy, validation, dtype=dy_dtype
+                        )
+                        with (
+                            torch.autocast(device_type=x.device.type, enabled=False)
+                            if config.rht_mode == "mxfp4"
+                            else nullcontext()
+                        ):
+                            dw[i] = bq.t() @ aq
                 _record(config, "grouped", "wgrad")
             # No invalid dx/dw can reach a parameter's accumulation/DDP hook.
             return dx, dw, None, None, None

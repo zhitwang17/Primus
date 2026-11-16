@@ -56,6 +56,17 @@ def test_grouped_deferred_validation_is_opt_in_and_requires_triton():
     assert options.value_checks == "grouped_deferred"
 
 
+def test_aligned_rht_cli_selects_h16_deterministic_without_changing_legacy_defaults():
+    base = ["--recipe", "nvfp4", "--output", "/tmp/result.json"]
+    old = SMOKE.parse_args(base)
+    assert (old.rht_mode, old.rht_size, old.rht_randomized) == ("legacy", 32, True)
+    aligned = SMOKE.parse_args(base + ["--rht-mode", "mxfp4"])
+    assert (aligned.rht_mode, aligned.rht_size, aligned.rht_randomized) == ("mxfp4", 16, False)
+    for extra in (["--rht-size", "32"], ["--rht-randomized"], ["--rht-size", "0"]):
+        with pytest.raises(SystemExit):
+            SMOKE.parse_args(base + ["--rht-mode", "mxfp4", *extra])
+
+
 @pytest.mark.parametrize("extra", [["--batch-size", "0"], ["--vocab-size", "9"], ["--lr", "0"]])
 def test_invalid_scale_options_rejected(extra):
     with pytest.raises(SystemExit):

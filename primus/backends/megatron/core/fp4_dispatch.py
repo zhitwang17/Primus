@@ -81,6 +81,7 @@ def build_two_level_config(config, fallback=None):
         "inner_storage": ("fp4_inner_storage", "float32_grid"),
         "rht_size": ("fp4_rht_size", 32),
         "rht_randomized": ("fp4_rht_randomized", True),
+        "rht_mode": ("fp4_rht_mode", "legacy"),
         "gradient_sr": ("fp4_gradient_sr", True),
         "rng_seed": ("fp4_rng_seed", option(config, "seed", 1234, fallback)),
         "quantizer": ("fp4_quantizer", "torch"),

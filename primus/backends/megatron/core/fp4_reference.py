@@ -234,20 +234,47 @@ def _rht_base(size):
     return (1 - 2 * parity).float()
 
 
+def _mxfp4_rht16(value):
+    """Turbo rht16_inplace's FP32 H4-local/XOR1/XOR2 operation order.
+
+    Consecutive groups of 16 rows are independent, giving H16x2 per 32 rows.
+    Explicit elementwise FP32 arithmetic avoids matmul/TF32 and preserves the
+    unrounded transform through scale selection and FP4 conversion. In BF16
+    training the caller selects BF16 only for the *dequantized* GEMM operands.
+    """
+    with torch.autocast(device_type=value.device.type, enabled=False):
+        value = value.float()
+        if value.shape[0] == 0:
+            return value
+        padded = F.pad(value, (0, 0, 0, (-value.shape[0]) % 16))
+        blocks = padded.reshape(padded.shape[0] // 16, 4, 4, value.shape[-1])
+        v0, v1, v2, v3 = blocks.unbind(2)
+        # Stage 1 is exactly the local H4 in Turbo's C++ producer.
+        a0, a1 = v0 + v1, v0 - v1
+        a2, a3 = v2 + v3, v2 - v3
+        local = torch.stack((a0 + a2, a1 + a3, a0 - a2, a1 - a3), dim=2)
+        # Stage 2: peer is tid XOR 1. Low lanes add peer + local; high
+        # lanes subtract peer - local. Stage 3 repeats with tid XOR 2.
+        g0, g1, g2, g3 = local.unbind(1)
+        p0, p1, p2, p3 = g1 + g0, g0 - g1, g3 + g2, g2 - g3
+        result = torch.stack((p2 + p0, p3 + p1, p0 - p2, p1 - p3), dim=1)
+        return (result * 0.25).reshape(padded.shape[0], value.shape[-1])
+
+
 @torch.no_grad()
 def rht_pair(x, dy, config, *, random=None, validation=None):
     """Apply the SAME orthogonal block transform on both wgrad token axes.
 
     Returns full padded rows: cropping a transformed tail before the wgrad
-    product breaks orthogonal cancellation. Inputs are transformed in FP32
-    and returned in their original dtype, matching the intended BF16 operand
-    boundary. H32 is the default; H16/disabled are distinct recipe settings.
+    product breaks orthogonal cancellation. Legacy mode transforms in FP32
+    with a matrix multiply and returns the original dtype, preserving old
+    recipes/checkpoints. H32 is the default; H16/disabled are distinct settings.
     ``rht_size=16, rht_randomized=False`` is deterministic H16x2 on each
     contiguous 32-token interval: two independent H16 transforms, normalized
-    by 1/4, with no mixing between the halves. Unlike Turbo's fused native
-    producer, this QDQ route rounds the FP32 transform back to the input
-    dtype before FP4 quantization. The geometry agrees; this boundary remains
-    a distinct numerical property of the reference compute route.
+    by 1/4, with no mixing between the halves. ``rht_mode=mxfp4`` additionally
+    uses Turbo's FP32 butterfly operation order and keeps FP32 output until
+    FP4 quantization; its callers restore the original GEMM operand dtype
+    during dequantization. Legacy H16 retains its earlier BF16 boundary.
     Randomized H uses row signs and a shared row/column permutation, freshly
     selected for this pair. Empty input and disabled RHT consume no RNG.
     """
@@ -255,6 +282,8 @@ def rht_pair(x, dy, config, *, random=None, validation=None):
     _check_input(dy, validation)
     if x.ndim != 2 or dy.ndim != 2 or x.shape[0] != dy.shape[0] or x.device != dy.device:
         raise ValueError("RHT requires two 2-D operands with equal token count and device")
+    if config.rht_mode == "mxfp4":
+        return _mxfp4_rht16(x), _mxfp4_rht16(dy)
     if config.rht_size == 0 or x.shape[0] == 0:
         return x, dy
     size = config.rht_size

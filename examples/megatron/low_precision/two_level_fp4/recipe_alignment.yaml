@@ -4,6 +4,7 @@
 # These options do not resume any previously stopped campaign.
 fp4_rht_size: 16
 fp4_rht_randomized: false
+fp4_rht_mode: mxfp4
 weight_deosc_shard_boundary_mode: zero_fill
 fp4_gradient_rounding_policy: shared_philox
 

@@ -89,6 +89,15 @@ def validate_shared_mxfp4_args(args):
         return False  # Their reference dispatch validates the same policy.
     if not getattr(args, "fp4", False) or _recipe(args) != "mxfp4":
         raise ValueError("shared_philox requires an enabled MXFP4/NVFP4/AMDFP4 recipe")
+    rht_mode = getattr(args, "fp4_rht_mode", "legacy")
+    if rht_mode not in ("legacy", "mxfp4"):
+        raise ValueError("fp4_rht_mode must be legacy or mxfp4")
+    if rht_mode == "mxfp4" and (
+        type(getattr(args, "fp4_rht_size", None)) is not int
+        or args.fp4_rht_size != 16
+        or getattr(args, "fp4_rht_randomized", None) is not False
+    ):
+        raise ValueError("Aligned MXFP4 RHT requires fp4_rht_size=16 and fp4_rht_randomized=false")
     for name in ("enable_primus_turbo", "use_turbo_gemm", "mxfp4_gradient_stochastic_rounding"):
         if not getattr(args, name, False):
             raise ValueError(f"MXFP4 shared_philox requires {name}=true")
@@ -168,7 +177,7 @@ def _identity(args, models):
             }
     if not parameters:
         raise ValueError("Cannot checkpoint shared MXFP4 SR without model parameters")
-    return {
+    identity = {
         "config": {name: _plain(getattr(args, name, None)) for name in _CONFIG_FIELDS},
         "parameters": parameters,
         "environment": {
@@ -180,6 +189,16 @@ def _identity(args, models):
             )
         },
     }
+    # Preserve the exact old sidecar identity for the legacy/default recipe.
+    # The explicit alignment policy is a new continuation contract, even though
+    # native MX already uses this deterministic FP32 H16 butterfly.
+    if getattr(args, "fp4_rht_mode", "legacy") != "legacy":
+        identity["rht_alignment"] = {
+            "mode": _plain(getattr(args, "fp4_rht_mode", None)),
+            "size": _plain(getattr(args, "fp4_rht_size", None)),
+            "randomized": _plain(getattr(args, "fp4_rht_randomized", None)),
+        }
+    return identity
 
 
 def shared_sr_checkpoint_state(args, models, iteration):

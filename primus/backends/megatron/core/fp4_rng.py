@@ -7,8 +7,9 @@ The GPU implementation is Philox4x32-10 with a 64-bit block counter in
 counter words 0/1, zero counter words 2/3, and the reservation's 64-bit seed
 as its key. Four consecutive logical padded elements consume the four output
 words of one block. A word's high 24 bits times 2**-24 gives a uniform in
-[0, 1). Kernel tiling does not change this mapping. RHT continues to use the
-small, private CPU reference generator in both modes.
+[0, 1). Kernel tiling does not change this mapping. Randomized legacy RHT uses
+the small private CPU reference generator with either SR implementation;
+deterministic RHT, including the aligned MXFP4 mode, consumes no RHT randomness.
 """
 
 REFERENCE_RNG_VERSION = "torch-cpu-reservation-sha256-v1"

@@ -274,6 +274,38 @@ def test_dense_fusion_environment_is_part_of_checkpoint_identity(shared_hooks, m
     assert not h.loads and h.runtime.state_dict() == before
 
 
+@pytest.mark.parametrize(
+    "mode,size,randomized", [("typo", 16, False), ("mxfp4", 32, False), ("mxfp4", 16, True)]
+)
+def test_explicit_native_rht_alignment_rejects_incompatible_settings(shared_hooks, mode, size, randomized):
+    h = shared_hooks
+    h.args.fp4_rht_mode, h.args.fp4_rht_size, h.args.fp4_rht_randomized = mode, size, randomized
+    with pytest.raises(ValueError, match="RHT|rht_mode"):
+        h.install()
+    assert not h.runtime.is_installed()
+
+
+def test_rht_alignment_preserves_legacy_sidecar_but_rejects_cross_mode_resume(shared_hooks):
+    h = shared_hooks
+    original = h.patch._identity(h.args, h.model)
+    h.args.fp4_rht_mode, h.args.fp4_rht_size, h.args.fp4_rht_randomized = "legacy", 32, True
+    assert h.patch._identity(h.args, h.model) == original
+    h.install()
+    h.training.get_model()
+    h.save()
+    before = h.runtime.state_dict()
+    h.args.fp4_rht_mode, h.args.fp4_rht_size, h.args.fp4_rht_randomized = "mxfp4", 16, False
+    assert h.patch.validate_shared_mxfp4_args(h.args)
+    assert h.patch._identity(h.args, h.model)["rht_alignment"] == {
+        "mode": "mxfp4",
+        "size": 16,
+        "randomized": False,
+    }
+    with pytest.raises(ValueError, match="identity"):
+        h.load()
+    assert not h.loads and h.runtime.state_dict() == before
+
+
 def test_late_fused_dense_override_is_rejected_before_model_build(shared_hooks, monkeypatch):
     h = shared_hooks
     h.install()

@@ -117,6 +117,9 @@ def parse_args(argv=None):
     parser.add_argument("--quantizer", choices=("torch", "triton"), default="torch")
     parser.add_argument("--sr-rng", choices=("torch_cpu", "triton_philox"), default="torch_cpu")
     parser.add_argument("--gradient-rounding-policy", choices=("recipe", "shared_philox"), default="recipe")
+    parser.add_argument("--rht-mode", choices=("legacy", "mxfp4"), default="legacy")
+    parser.add_argument("--rht-size", type=int, choices=(0, 16, 32), default=None)
+    parser.add_argument("--rht-randomized", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--value-checks", choices=("strict", "grouped_deferred"), default="strict")
     parser.add_argument("--outer-scope", choices=("tensor", "none"), default="tensor")
     parser.add_argument("--comparison-rmsnorm-backend", choices=("native", "torch"), default="native")
@@ -142,6 +145,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--recompute", action="store_true", help="Exercise full-layer activation recompute")
     args = parser.parse_args(argv)
+    if args.rht_size is None:
+        args.rht_size = 16 if args.rht_mode == "mxfp4" else 32
+    if args.rht_randomized is None:
+        args.rht_randomized = args.rht_mode == "legacy"
+    if args.rht_mode == "mxfp4" and (args.rht_size != 16 or args.rht_randomized):
+        parser.error("mxfp4 RHT requires --rht-size 16 --no-rht-randomized")
     args.seq_length = args.seq_length or (32 if args.model_profile == "gpt-oss" else 64)
     args.batch_size = (
         args.batch_size if args.batch_size is not None else (1 if args.model_profile == "gpt-oss" else 2)
@@ -294,6 +303,9 @@ def _make_config(args):
     config.fp4_quantizer = args.quantizer
     config.fp4_sr_rng = args.sr_rng
     config.fp4_gradient_rounding_policy = args.gradient_rounding_policy
+    config.fp4_rht_mode = getattr(args, "rht_mode", "legacy")
+    config.fp4_rht_size = getattr(args, "rht_size", 32)
+    config.fp4_rht_randomized = getattr(args, "rht_randomized", True)
     config.fp4_value_checks = args.value_checks
     config.fp4_outer_scope = args.outer_scope
     config.fp4_comparison_rmsnorm_backend = args.comparison_rmsnorm_backend
