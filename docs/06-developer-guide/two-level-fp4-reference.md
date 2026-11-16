@@ -285,6 +285,41 @@ The mergeable `examples/megatron/low_precision/two_level_fp4/recipe_alignment.ya
 fragment lists the common settings. Native MX consumers still require their
 Turbo GEMM route flags; the two-level reference consumers keep their own routes.
 
+### November 16 recipe-gap verification
+
+The low-precision CPU suite passed **583 tests**, with **38 device-dependent
+skips**. Additional Triton interpreter and actual MI355X device checks matched
+the shared SR packed values against an independent NumPy Philox/E2M1 oracle,
+including H16, transpose, tails, grouped offsets and high counter words.
+Native MX dense/batched/grouped scales, UOS mode 2 and consumer layouts stayed
+unchanged; dense and ragged grouped forward/dgrad/wgrad GEMM smoke checks passed.
+Those GEMM checks use a quantization-tolerant relative-error bound against
+unquantized products; the separate packed-value oracle is bit-exact.
+
+The first grouped preservation check incorrectly compared uninitialized
+upper-bound allocation tails across separate native calls. The corrected check
+compares the complete same allocation before/after SR (no scale/metadata writes)
+and the actual consumer region across calls (zero mismatches); all 2048 differing
+bytes were outside the used col-scale region. No numerical kernel change or
+valid-region tolerance relaxation was needed.
+
+`tools/fp4_deosc_shard_validate.py` passed on two GPUs with real NCCL and Triton:
+40 boundary cases and four checkpoint replays **per rank**. Its default DeOsc
+step exchanged only 56 bytes of logical MAX payload per parameter in these
+single-binding cases (48 bytes for window agreement, 8 for outer/finite values),
+with no boundary-weight SUM. This counts collective tensor payload, not network
+wire traffic or a performance benchmark.
+
+NVFP4 and AMDFP4 each passed a separate **two-GPU, eight-update tiny-model**
+`fp4_smoke.py` run with `--optimizer-profile default-bf16-adam`, tensor outer
+scale, shared Philox and zero-fill boundaries. Both executed real fused Adam
+with BF16 moments/FP32 masters, reached DeOsc snaps, saved after update 4 and
+replayed updates 5-8 exactly, including model, optimizer, gradients and RNG.
+These reduced synthetic checks do not qualify full-model convergence, DP8 or
+default full-scale communication performance. No 3K/full training was launched;
+the user's prior queue hold remains in force. Older validation notes below are
+historical and predate these targeted checks.
+
 ## Validation and reproduction
 
 CPU tests execute the complete reference operators and adapters. External
